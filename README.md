@@ -9,18 +9,40 @@ memory design actually buy you at p99?**
 
 Headline, on an Apple M3 (arm64, clang 21, `-O3 -march=native`, C++20):
 
-| ns per operation | baseline | pooled baseline | optimized |
-| ---------------- | -------- | --------------- | --------- |
-| batched timing   | 60.0     | 36.3            | **15.7**  |
-| throughput       | 16.6M/s  | 27.1M/s         | **60.6M/s** |
-| vs. baseline     | —        | 1.64×           | **3.66×** |
+| ns/op (batched)  | baseline | + pool alloc | optimized |
+| ---------------- | -------- | ------------ | --------- |
+| batched timing   | 61.6     | 35.8         | **15.8**  |
+| throughput       | 16.1M/s  | 27.2M/s      | **60.8M/s** |
+| vs. baseline     | —        | 1.69×        | **3.77×** |
 
-**Read the middle column first.** "Pooled baseline" is the baseline's exact
-algorithm and container shapes over a freelist allocator instead of `malloc`. It
-recovers 1.64× of the 3.66× total, which means roughly *half* the win is simply not
-calling the general-purpose allocator, and the other half is the cache-friendly
-layout. Without that control, the two are indistinguishable and the project's thesis
-is unsupported.
+**These ratios are a property of this machine and this allocator, not of the
+engines alone.** A run on Linux/x86 with glibc and g++ 13 reported 88.9 → 71.1 →
+31.0 ns/op: a 2.72× total rather than 3.77×, with the allocator accounting for
+1.21× rather than 1.69×. macOS `libmalloc` is markedly slower than glibc's, so it
+flatters the pooled control. Treat the split as **allocator-dependent, somewhere
+between a fifth and a half of the log-gap**, and the total as machine-dependent
+too. Reproducing on your own hardware is one `make run-bench`.
+
+### Decomposing the win
+
+"Faster because it is cache-friendly" and "faster because it never calls malloc"
+are different claims, and one control cannot separate them — a freelist removes
+`malloc` *and* clusters the live nodes, so it would take credit for part of the
+layout's win. There are therefore two controls, both running the baseline's exact
+algorithm and container shapes:
+
+| step | ns/op | ratio | what it isolates |
+| ---- | ----- | ----- | ---------------- |
+| baseline | 61.6 | — | `std::map` + `std::list` + `malloc` |
+| → scattered pool | 36.3 | 1.70× | no `malloc`, addresses left spread out |
+| → clustered pool | 35.8 | 1.01× | same allocator, live nodes compacted |
+| → optimized | 15.8 | 2.27× | flat levels, slab arena, hierarchical bitmap |
+
+The clustering step is worth about **1%** here, so on this workload the freelist's
+locality bonus is negligible and the 1.70× really is allocation cost. That is a
+result about *this* tape, though: the live set is ~65k orders and stays cache-
+resident whether it is compacted or not, so this control cannot detect a locality
+effect that would only appear with a much larger book. See Known gaps.
 
 ### What is not measurable here
 
@@ -68,12 +90,14 @@ Benchmark flags: `--events=N --seed=N --reps=N --capacity=N --aggressive=PCT
 | Path                        | What it is                                                                 |
 | --------------------------- | -------------------------------------------------------------------------- |
 | `src/types.h`               | Shared `Price` / `Qty` / `OrderId` / `Side` / `Trade` / `BookConfig`       |
-| `src/orderBook.{h,cpp}`     | Baseline: ordered map per side, list per level, hash index                 |
+| `src/orderBook.h` | Baseline, templated on the allocator: `OrderBook`, `PooledOrderBook`, `ScatteredOrderBook` |
+| `src/poolAllocator.h` | Clustered and scattered freelist allocators — the two attribution controls |
 | `src/fastOrderBook.{h,cpp}` | Flat tick-indexed levels, hierarchical bitmap, slab arena, open addressing |
 | `bench/flow.h`              | Deterministic order-flow generator                                         |
 | `bench/histogram.h`         | Preallocated sample storage and percentile reporting                       |
 | `bench/benchmark.cpp`       | Templated driver, side-by-side comparison                                  |
 | `tests/conformance.cpp`     | Unit matching cases + event-by-event differential                          |
+| `.github/workflows/ci.yml` | Build, test, and ASan on Linux (gcc + clang) and macOS |
 | `src/main.cpp`              | Small demo that prints the book as it changes                              |
 
 Both engines expose the **same concrete API with no virtual functions** — the benchmark is
@@ -217,9 +241,12 @@ most of its p99 advantage.
 | `maxOrders` | throughput  | p99    |
 | ----------- | ----------- | ------ |
 | 2^20        | 22.8M ops/s | 125 ns |
-| 2^17        | 30.2M ops/s | 42 ns  |
+| 2^17        | 30.2M ops/s | 42 ns*  |
 
 Size `BookConfig::maxOrders` to the real live-order count, not to a comfortable upper bound.
+
+\* 42 ns is the harness floor — see the null-book row above. The throughput
+column is the load-bearing half of that table.
 
 ### The through-line
 
@@ -286,9 +313,13 @@ A faster book that matches differently is not a faster book.
 ## Known gaps
 
 - **Per-optimization attribution within the fast book.** The allocator is now
-  separated from the layout, but the four structural changes inside the optimized
-  book — flat levels, hierarchical bitmap, slab arena, open addressing — are still
-  measured only as a bundle.
+  separated from the layout, and clustering separated from allocation cost, but the
+  four structural changes inside the optimized book — flat levels, hierarchical
+  bitmap, slab arena, open addressing — are still measured only as a bundle.
+- **The locality control is workload-limited.** The scattered-vs-clustered pool
+  differs by ~1% here because the live set stays cache-resident either way. On a
+  book large enough to miss L2 the split between "allocator" and "locality" could
+  look quite different, and this tape cannot show it.
 - **The tape is benign.** Mid random-walks one tick at a time and orders rest within
   64 ticks of it, so the working set is ~128 levels and stays cache-resident. There
   are no gap-ups, halts, wide spreads, or arrival bursts, which means the deep-scan

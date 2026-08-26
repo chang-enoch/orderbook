@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -361,6 +362,35 @@ bool DifferentialPair(const char* label, const std::vector<bench::Event>& stream
     return true;
 }
 
+// Admission rules that stop at the constructor are still admission rules. Each
+// of these configs used to be accepted by one engine and refused -- or fatally
+// mishandled -- by the other.
+void ConfigCases() {
+    g_case = "config-validation";
+    const BookConfig good{1, 1000, 1, 4096};
+    CheckStatus(ValidateConfig(good), Status::Ok, "a sane config validates");
+
+    struct Bad { BookConfig cfg; const char* why; };
+    const Bad bad[] = {
+        {{1, 1000, 1, 0}, "maxOrders = 0"},
+        {{1000, 1, 1, 64}, "minPrice > maxPrice"},
+        {{1, 1000, 0, 64}, "tick = 0"},
+        {{1, 1000, -5, 64}, "negative tick"},
+    };
+    for (const Bad& b : bad) {
+        CheckStatus(ValidateConfig(b.cfg), Status::InvalidConfig, b.why);
+        // Every engine must refuse it the same way -- silently coercing it, as
+        // tick = 0 used to be coerced to 1, is how configs diverge unnoticed.
+        bool baseThrew = false, poolThrew = false, fastThrew = false;
+        try { OrderBook x(b.cfg); (void)x; } catch (const std::exception&) { baseThrew = true; }
+        try { PooledOrderBook x(b.cfg); (void)x; } catch (const std::exception&) { poolThrew = true; }
+        try { FastOrderBook x(b.cfg); (void)x; } catch (const std::exception&) { fastThrew = true; }
+        Check(baseThrew && poolThrew && fastThrew,
+              std::string("all engines reject ") + b.why);
+    }
+    std::printf("  config cases done\n");
+}
+
 bool Differential(std::uint64_t seed, std::size_t events, Price tick,
                   int pctInvalid, std::size_t maxOrders) {
     bench::FlowConfig flow;
@@ -388,6 +418,8 @@ bool Differential(std::uint64_t seed, std::size_t events, Price tick,
     // allocator, so any disagreement there is an allocator bug, not a logic one.
     ok &= DifferentialPair<OrderBook, PooledOrderBook>("pooled vs baseline",
                                                        stream, cfg, seed);
+    ok &= DifferentialPair<OrderBook, ScatteredOrderBook>("scattered vs baseline",
+                                                          stream, cfg, seed);
     ok &= DifferentialPair<OrderBook, FastOrderBook>("fast vs baseline", stream,
                                                      cfg, seed);
     return ok;
@@ -402,7 +434,9 @@ int main(int argc, char** argv) {
     std::printf("unit cases:\n");
     UnitCases<OrderBook>("baseline");
     UnitCases<PooledOrderBook>("pooled");
+    UnitCases<ScatteredOrderBook>("scattered");
     UnitCases<FastOrderBook>("optimized");
+    ConfigCases();
 
     std::printf("\ndifferential:\n");
     struct Case { std::uint64_t seed; Price tick; int invalid; std::size_t cap; };

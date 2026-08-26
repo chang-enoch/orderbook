@@ -31,8 +31,13 @@ $(BUILD)/orderbook_test_asan: tests/conformance.cpp $(LIB_SRC) | $(BUILD)
 	$(CXX) $(STD) -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 	  $(WARN) $(INCLUDE) $^ -o $@
 
+# alloc_dealloc_mismatch is OFF by default in Apple's ASan runtime, so a
+# new[]/operator-delete mismatch in the pool allocator went unseen on macOS
+# while GCC flagged it on Linux. Force it on rather than trust the default.
+ASAN_OPTIONS ?= alloc_dealloc_mismatch=1:detect_leaks=0
+
 asan: $(BUILD)/orderbook_test_asan
-	./$(BUILD)/orderbook_test_asan 200000
+	ASAN_OPTIONS=$(ASAN_OPTIONS) ./$(BUILD)/orderbook_test_asan 200000
 
 
 run-test: $(BUILD)/orderbook_test

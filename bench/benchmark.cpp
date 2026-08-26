@@ -93,6 +93,9 @@ RunResult Run(const std::vector<Event>& events, const BookConfig& cfg,
 // from a span many ticks long. This is the resolution-independent view: it
 // cannot show a tail, but its central estimate does not sit on the timer floor
 // the way a 1-tick p50 does.
+// Statistics over *batch means*, not over individual operations. A "p99" here
+// is the 99th-percentile batch, which smooths any tail inside a batch -- it is
+// not comparable with the per-operation p99 above, and the column headers say so.
 struct BatchStats {
     double meanNs = 0, p50Ns = 0, p99Ns = 0;
 };
@@ -307,41 +310,80 @@ int main(int argc, char** argv) {
     std::printf("\n=== batched timing, %zu ops per clock pair (ns/op) ===\n", batch);
     std::printf("  not quantized by the timer, so these survive a machine with a\n"
                 "  different tick; they cannot show a tail\n");
-    std::printf("  %-10s %10s %10s %10s\n", "engine", "mean", "p50", "p99");
+    std::printf("  %-10s %10s %10s %10s\n", "engine", "mean", "median", "p99");
+    std::printf("  %-10s %10s %10s %10s\n", "", "ns/op", "batch", "batch");
     auto batchRow = [&](const char* label, const BatchStats& b) {
         std::printf("  %-10s %10.1f %10.1f %10.1f\n", label, b.meanNs, b.p50Ns,
                     b.p99Ns);
     };
-    batchRow("null", RunBatched<NullBook>(events, cfg, warmup, batch));
-    batchRow("baseline", RunBatched<OrderBook>(events, cfg, warmup, batch));
-    batchRow("pooled", RunBatched<PooledOrderBook>(events, cfg, warmup, batch));
+    // Repeated and interleaved, like the latency and throughput passes. Running
+    // each engine once, in engine order, is exactly the protocol that lets drift
+    // over the life of the process masquerade as a difference between engines.
+    std::vector<BatchStats> bn, bb, bp, bs, bf;
+    for (int i = 0; i < reps; ++i) {
+        bn.push_back(RunBatched<NullBook>(events, cfg, warmup, batch));
+        bb.push_back(RunBatched<OrderBook>(events, cfg, warmup, batch));
+        bp.push_back(RunBatched<PooledOrderBook>(events, cfg, warmup, batch));
+        bs.push_back(RunBatched<ScatteredOrderBook>(events, cfg, warmup, batch));
 #ifdef ORDERBOOK_HAS_FAST
-    batchRow("optimized", RunBatched<FastOrderBook>(events, cfg, warmup, batch));
+        bf.push_back(RunBatched<FastOrderBook>(events, cfg, warmup, batch));
+#endif
+    }
+    auto medianBatch = [](std::vector<BatchStats> v) {
+        std::sort(v.begin(), v.end(), [](const BatchStats& a, const BatchStats& b) {
+            return a.meanNs < b.meanNs;
+        });
+        return v[v.size() / 2];
+    };
+    const BatchStats mb = medianBatch(bb), mp = medianBatch(bp),
+                     ms = medianBatch(bs);
+    batchRow("null", medianBatch(bn));
+    batchRow("baseline", mb);
+    batchRow("scattered", ms);
+    batchRow("pooled", mp);
+#ifdef ORDERBOOK_HAS_FAST
+    const BatchStats mf = medianBatch(bf);
+    batchRow("optimized", mf);
+    std::printf("\n  allocator vs locality, from the batched means:\n");
+    std::printf("    baseline -> scattered  %.2fx   no malloc, malloc-like scatter\n",
+                mb.meanNs / ms.meanNs);
+    std::printf("    scattered -> pooled    %.2fx   same allocator, clustered addresses\n",
+                ms.meanNs / mp.meanNs);
+    std::printf("    pooled -> optimized    %.2fx   flat levels, arena, bitmap\n",
+                mp.meanNs / mf.meanNs);
 #endif
 
     std::printf("\n=== throughput, no per-op instrumentation (median of %d) ===\n",
                 reps);
-    std::size_t bTrades = 0, pTrades = 0, fTrades = 0;
-    std::vector<double> bM, pM, fM;
+    std::size_t bTrades = 0, pTrades = 0, sTrades = 0, fTrades = 0;
+    std::vector<double> bM, pM, sM, fM;
     for (int i = 0; i < reps; ++i) {
         bM.push_back(RunUntimed<OrderBook>(events, cfg, warmup, bTrades));
+        sM.push_back(RunUntimed<ScatteredOrderBook>(events, cfg, warmup, sTrades));
         pM.push_back(RunUntimed<PooledOrderBook>(events, cfg, warmup, pTrades));
 #ifdef ORDERBOOK_HAS_FAST
         fM.push_back(RunUntimed<FastOrderBook>(events, cfg, warmup, fTrades));
 #endif
     }
-    const double bMops = Median(bM), pMops = Median(pM);
+    const double bMops = Median(bM), pMops = Median(pM), sMops = Median(sM);
     std::printf("  %-10s %10.2f M ops/sec\n", "baseline", bMops);
-    std::printf("  %-10s %10.2f M ops/sec   %.2fx over baseline  <- allocator alone\n",
+    std::printf("  %-10s %10.2f M ops/sec   %.2fx  no malloc, scattered\n",
+                "scattered", sMops, sMops / bMops);
+    std::printf("  %-10s %10.2f M ops/sec   %.2fx  no malloc, clustered\n",
                 "pooled", pMops, pMops / bMops);
 #ifdef ORDERBOOK_HAS_FAST
     const double fMops = Median(fM);
     std::printf("  %-10s %10.2f M ops/sec   %.2fx over baseline, %.2fx over pooled\n",
                 "optimized", fMops, fMops / bMops, fMops / pMops);
-    std::printf("\n  The pooled row is the control that splits the result: it is the\n"
-                "  baseline's exact algorithm and container shapes over a freelist\n"
-                "  allocator. Whatever it recovers is the cost of malloc; whatever\n"
-                "  the optimized row adds on top of it is the cost of the layout.\n");
+    std::printf("\n  The middle two rows are the controls that decompose the result.\n"
+                "  Both run the baseline's exact algorithm and container shapes over\n"
+                "  a freelist, so neither calls malloc; they differ only in whether\n"
+                "  the live nodes end up clustered or spread out. baseline ->\n"
+                "  scattered is the allocator's share, scattered -> pooled is the\n"
+                "  locality a freelist gives away for free, and the rest is layout.\n"
+                "\n  This split is a property of THIS allocator and THIS machine.\n"
+                "  A run against glibc reports a materially smaller allocator share\n"
+                "  than macOS libmalloc does -- see the README.\n");
 
     if (base.trades != fast.trades || bTrades != fTrades || base.trades != pool.trades)
         std::printf("\n  WARNING: trade counts differ (%llu / %llu / %llu)\n",
@@ -349,7 +391,7 @@ int main(int argc, char** argv) {
                     (unsigned long long)pool.trades,
                     (unsigned long long)fast.trades);
     else
-        std::printf("\n  all three engines produced %llu trades\n",
+        std::printf("\n  all engines produced %llu trades\n",
                     (unsigned long long)base.trades);
 #endif
     return 0;

@@ -1,0 +1,57 @@
+name: ci
+
+# The project was developed on a single machine and a single toolchain, and
+# that monoculture is what let a new[]/operator-delete mismatch and an
+# allocator-specific conclusion ship unnoticed: Apple's ASan disables
+# alloc_dealloc_mismatch by default, and macOS libmalloc is much slower relative
+# to glibc than the README implied. Building and measuring on Linux/glibc with
+# both GCC and Clang is the cheapest guard against repeating that.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cxx: g++ }
+          - { os: ubuntu-latest, cxx: clang++ }
+          - { os: macos-latest,  cxx: clang++ }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make all CXX=${{ matrix.cxx }}
+
+      - name: Unit and differential tests
+        run: make run-test CXX=${{ matrix.cxx }}
+
+      - name: ASan + UBSan
+        run: make asan CXX=${{ matrix.cxx }}
+
+      - name: Demo
+        run: ./build/orderbook_demo
+
+  cmake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  # Not a pass/fail gate -- hardware and allocator vary too much for a
+  # threshold to mean anything. It exists so the numbers are visible on a
+  # second allocator (glibc) instead of being reported from one laptop.
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make all
+      - name: Benchmark (glibc)
+        run: ./build/orderbook_bench --events=2000000 --reps=3

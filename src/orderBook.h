@@ -9,6 +9,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,11 +42,15 @@ public:
         OrderList orders;
     };
 
+    // Throws on an invalid config rather than limping along with a silently
+    // coerced one. Both engines throw on exactly the same inputs.
     explicit BasicOrderBook(const BookConfig& cfg = {})
         : minPrice_(cfg.minPrice),
           maxPrice_(cfg.maxPrice),
-          tick_(cfg.tick == 0 ? 1 : cfg.tick),
+          tick_(cfg.tick),
           maxOrders_(cfg.maxOrders) {
+        if (ValidateConfig(cfg) != Status::Ok)
+            throw std::invalid_argument("BookConfig: invalid-config");
         // Rehashing mid-run would show up as pure noise in the tail.
         index_.reserve(cfg.maxOrders);
     }
@@ -242,5 +247,10 @@ private:
 
 // The two variants under test. Identical code, identical container shapes; the
 // only difference is where the nodes come from.
-using OrderBook       = BasicOrderBook<std::allocator>;
-using PooledOrderBook = BasicOrderBook<PoolAlloc>;
+using OrderBook = BasicOrderBook<std::allocator>;
+
+// The two allocator controls. Identical code, identical container shapes; the
+// only difference is where the nodes come from and how they are spread out.
+// See poolAllocator.h for why one control is not enough.
+using PooledOrderBook    = BasicOrderBook<PoolAlloc>;         // no malloc, clustered
+using ScatteredOrderBook = BasicOrderBook<ScatterPoolAlloc>;  // no malloc, spread out

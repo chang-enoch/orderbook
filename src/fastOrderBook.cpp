@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <stdexcept>
 
 namespace {
 std::size_t NextPow2(std::size_t n) {
@@ -15,10 +16,14 @@ std::size_t NextPow2(std::size_t n) {
 FastOrderBook::FastOrderBook(const BookConfig& cfg)
     : minPrice_(cfg.minPrice),
       maxPrice_(cfg.maxPrice),
-      tick_(cfg.tick == 0 ? 1 : cfg.tick),
-      levelCount_(static_cast<std::size_t>((cfg.maxPrice - cfg.minPrice) /
-                                           (cfg.tick == 0 ? 1 : cfg.tick)) +
-                  1) {
+      tick_(cfg.tick),
+      levelCount_(0) {
+    if (ValidateConfig(cfg) != Status::Ok)
+        throw std::invalid_argument("BookConfig: invalid-config");
+    // Only safe once the config is validated: an inverted band would make this
+    // subtraction negative and the cast to size_t enormous.
+    levelCount_ = static_cast<std::size_t>((cfg.maxPrice - cfg.minPrice) / tick_) + 1;
+
     levels_.assign(levelCount_, FlatLevel{});
     bidMap_.Init(levelCount_);
     askMap_.Init(levelCount_);

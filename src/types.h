@@ -23,6 +23,7 @@ enum class Status : std::uint8_t {
     PriceOutOfBand,
     PriceNotOnTick,
     CapacityExhausted,
+    InvalidConfig,
 };
 
 inline const char* StatusName(Status s) {
@@ -35,6 +36,7 @@ inline const char* StatusName(Status s) {
         case Status::PriceOutOfBand:    return "price-out-of-band";
         case Status::PriceNotOnTick:    return "price-not-on-tick";
         case Status::CapacityExhausted: return "capacity-exhausted";
+        case Status::InvalidConfig:     return "invalid-config";
     }
     return "?";
 }
@@ -67,15 +69,28 @@ struct Trade {
 inline constexpr Price kNoBid = std::numeric_limits<Price>::min();
 inline constexpr Price kNoAsk = std::numeric_limits<Price>::max();
 
-// Both engines take the same config so the benchmark can build them uniformly.
-// The baseline ignores the price band; the optimized book indexes into a flat
-// array over it and rejects orders outside.
+// Both engines take the same config and enforce it identically. The baseline
+// has no structural need for a price band -- a std::map would hold any price --
+// but enforcing the same rules is what makes "identical semantics" a testable
+// claim rather than an assertion.
 struct BookConfig {
     Price       minPrice  = 1;
     Price       maxPrice  = 1'000'000;
     Price       tick      = 1;
     std::size_t maxOrders = 1u << 20;
 };
+
+// Admission rules stop at the constructor unless the config itself is checked.
+// Before this existed, maxOrders == 0 was capacity-exhausted on one engine and
+// accepted on the other, and minPrice > maxPrice constructed fine on one and
+// threw std::length_error out of the other's vector sizing -- the same class of
+// silent divergence as the per-order rules.
+inline Status ValidateConfig(const BookConfig& cfg) {
+    if (cfg.tick <= 0) return Status::InvalidConfig;
+    if (cfg.minPrice > cfg.maxPrice) return Status::InvalidConfig;
+    if (cfg.maxOrders == 0) return Status::InvalidConfig;
+    return Status::Ok;
+}
 
 inline constexpr Side Opposite(Side s) {
     return s == Side::Buy ? Side::Sell : Side::Buy;
