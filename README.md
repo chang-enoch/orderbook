@@ -16,12 +16,23 @@ Headline, on an Apple M3 (arm64, clang 21, `-O3 -march=native`, C++20):
 | vs. baseline     | —        | 1.69×        | **3.77×** |
 
 **These ratios are a property of this machine and this allocator, not of the
-engines alone.** A run on Linux/x86 with glibc and g++ 13 reported 88.9 → 71.1 →
-31.0 ns/op: a 2.72× total rather than 3.77×, with the allocator accounting for
-1.21× rather than 1.69×. macOS `libmalloc` is markedly slower than glibc's, so it
-flatters the pooled control. Treat the split as **allocator-dependent, somewhere
-between a fifth and a half of the log-gap**, and the total as machine-dependent
-too. Reproducing on your own hardware is one `make run-bench`.
+engines alone.** CI runs the same benchmark on ubuntu/glibc/gcc every push, and
+reports a materially different decomposition:
+
+| ns/op | M3 · libmalloc · clang | CI · glibc · gcc |
+| ----- | ---------------------- | ---------------- |
+| baseline | 61.6 | 71.7 |
+| → scattered pool | 36.3 (**1.70×**) | 63.0 (**1.14×**) |
+| → clustered pool | 35.8 (1.01×) | 62.3 (1.01×) |
+| → optimized | 15.8 | 28.6 |
+| **total** | **3.77×** | **2.52×** |
+
+macOS `libmalloc` is markedly slower than glibc's, so it flatters the allocator
+control: the same code attributes **1.70×** to allocation on macOS and **1.14×**
+on Linux. The total moves too, 3.77× against 2.52×. Neither number is *the*
+answer — the honest statement is that the layout is worth ~2.2× on both, and the
+allocator is worth anywhere from 1.14× to 1.70× depending on whose `malloc` you
+are replacing.
 
 ### Decomposing the win
 
@@ -38,11 +49,16 @@ algorithm and container shapes:
 | → clustered pool | 35.8 | 1.01× | same allocator, live nodes compacted |
 | → optimized | 15.8 | 2.27× | flat levels, slab arena, hierarchical bitmap |
 
-The clustering step is worth about **1%** here, so on this workload the freelist's
-locality bonus is negligible and the 1.70× really is allocation cost. That is a
-result about *this* tape, though: the live set is ~65k orders and stays cache-
-resident whether it is compacted or not, so this control cannot detect a locality
-effect that would only appear with a much larger book. See Known gaps.
+The clustering step is worth about **1%**, and it measures 1.01× on *both*
+platforms — so on this workload the freelist's locality bonus is negligible and
+the allocator step really is allocation cost. That replication across two
+allocators and two microarchitectures is what makes it a result rather than a
+coincidence.
+
+It is still a result about *this* tape, though: the live set is ~65k orders and
+stays cache-resident whether it is compacted or not, so this control cannot
+detect a locality effect that would only appear with a much larger book. See
+Known gaps.
 
 ### What is not measurable here
 
