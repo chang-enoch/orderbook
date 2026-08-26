@@ -12,6 +12,13 @@ namespace {
 int g_failures = 0;
 const char* g_case = "";
 
+void CheckStatus(Status got, Status want, const std::string& what) {
+    if (got == want) return;
+    std::printf("  FAIL [%s] %s: got %s, want %s\n", g_case, what.c_str(),
+                StatusName(got), StatusName(want));
+    ++g_failures;
+}
+
 void Check(bool ok, const std::string& what) {
     if (ok) return;
     std::printf("  FAIL [%s] %s\n", g_case, what.c_str());
@@ -157,9 +164,9 @@ void UnitCases(const char* engine) {
         Book b(cfg);
         std::vector<Trade> tr;
         b.AddOrder(1, Side::Buy, 100, 10, TimeInForce::Gtc, tr);
-        Check(b.CancelOrder(1), "cancel succeeds");
-        Check(!b.CancelOrder(1), "double cancel fails");
-        Check(!b.CancelOrder(999), "unknown cancel fails");
+        CheckStatus(b.CancelOrder(1), Status::Ok, "cancel succeeds");
+        CheckStatus(b.CancelOrder(1), Status::UnknownId, "double cancel");
+        CheckStatus(b.CancelOrder(999), Status::UnknownId, "unknown cancel");
         CheckEq(b.BestBid(), kNoBid, "book empty");
         CheckEq(b.OrderCount(), std::size_t{0}, "no live orders");
     }
@@ -167,12 +174,92 @@ void UnitCases(const char* engine) {
         g_case = "rejects";
         Book b(cfg);
         std::vector<Trade> tr;
-        b.AddOrder(1, Side::Buy, 100, 10, TimeInForce::Gtc, tr);
-        b.AddOrder(1, Side::Buy, 101, 10, TimeInForce::Gtc, tr);  // duplicate id
-        CheckEq(b.OrderCount(), std::size_t{1}, "duplicate id rejected");
-        b.AddOrder(2, Side::Buy, 100, 0, TimeInForce::Gtc, tr);  // zero qty
-        CheckEq(b.OrderCount(), std::size_t{1}, "zero qty rejected");
-        Check(!b.ModifyOrder(999, 100, 5, tr), "modify unknown fails");
+        CheckStatus(b.AddOrder(1, Side::Buy, 100, 10, TimeInForce::Gtc, tr),
+                    Status::Ok, "first add");
+        CheckStatus(b.AddOrder(1, Side::Buy, 101, 10, TimeInForce::Gtc, tr),
+                    Status::DuplicateId, "duplicate id");
+        CheckStatus(b.AddOrder(2, Side::Buy, 100, 0, TimeInForce::Gtc, tr),
+                    Status::ZeroQty, "zero qty");
+        CheckStatus(b.ModifyOrder(999, 100, 5, tr), Status::UnknownId,
+                    "modify unknown");
+        CheckStatus(b.CancelOrder(999), Status::UnknownId, "cancel unknown");
+        CheckEq(b.OrderCount(), std::size_t{1}, "only the valid add landed");
+    }
+    {
+        // Every one of these silently diverged between the two engines before
+        // there was a rejection channel to report them through.
+        g_case = "admission-rules";
+        Book b(cfg);
+        std::vector<Trade> tr;
+
+        // Zero is an ordinary id. It used to be the hash table's empty
+        // sentinel: the add was refused as a duplicate and the cancel read out
+        // of bounds.
+        CheckStatus(b.AddOrder(0, Side::Buy, 100, 10, TimeInForce::Gtc, tr),
+                    Status::Ok, "id 0 is legal");
+        CheckEq(b.QtyAt(Side::Buy, 100), Qty{10}, "id 0 actually rests");
+        CheckStatus(b.CancelOrder(0), Status::Ok, "id 0 cancels");
+        CheckStatus(b.CancelOrder(0), Status::UnknownId, "id 0 gone");
+
+        CheckStatus(b.AddOrder(kReservedOrderId, Side::Buy, 100, 10,
+                               TimeInForce::Gtc, tr),
+                    Status::ReservedId, "reserved id refused");
+        CheckStatus(b.CancelOrder(kReservedOrderId), Status::ReservedId,
+                    "reserved id cancel refused");
+
+        CheckStatus(b.AddOrder(20, Side::Buy, cfg.maxPrice + 1, 10,
+                               TimeInForce::Gtc, tr),
+                    Status::PriceOutOfBand, "above band");
+        CheckStatus(b.AddOrder(21, Side::Buy, cfg.minPrice - 1, 10,
+                               TimeInForce::Gtc, tr),
+                    Status::PriceOutOfBand, "below band");
+        CheckEq(b.OrderCount(), std::size_t{0}, "nothing out-of-band rested");
+
+        // A rejected modify must leave the original untouched. It used to
+        // cancel first, fail the re-add, and report success.
+        CheckStatus(b.AddOrder(30, Side::Buy, 100, 10, TimeInForce::Gtc, tr),
+                    Status::Ok, "order to modify");
+        CheckStatus(b.ModifyOrder(30, cfg.maxPrice + 1, 10, tr),
+                    Status::PriceOutOfBand, "reprice out of band refused");
+        CheckEq(b.OrderCount(), std::size_t{1}, "order survived the refusal");
+        CheckEq(b.QtyAt(Side::Buy, 100), Qty{10}, "and kept its price and size");
+    }
+    {
+        g_case = "tick-alignment";
+        BookConfig t = cfg;
+        t.minPrice = 0;
+        t.tick = 5;
+        Book b(t);
+        std::vector<Trade> tr;
+        CheckStatus(b.AddOrder(1, Side::Buy, 100, 10, TimeInForce::Gtc, tr),
+                    Status::Ok, "aligned add");
+        CheckStatus(b.AddOrder(2, Side::Buy, 102, 10, TimeInForce::Gtc, tr),
+                    Status::PriceNotOnTick, "off-tick add");
+        CheckStatus(b.ModifyOrder(1, 102, 10, tr), Status::PriceNotOnTick,
+                    "off-tick reprice");
+        CheckEq(b.OrderCount(), std::size_t{1}, "order survived off-tick reprice");
+        CheckEq(b.QtyAt(Side::Buy, 100), Qty{10}, "unchanged");
+    }
+    {
+        // Capacity gates resting, not admission: an aggressive order reduces
+        // the book and must still be allowed to trade.
+        g_case = "capacity";
+        BookConfig t = cfg;
+        t.maxOrders = 8;
+        Book b(t);
+        std::vector<Trade> tr;
+        for (int i = 0; i < 8; ++i)
+            CheckStatus(b.AddOrder(100 + i, Side::Buy, 100, 1, TimeInForce::Gtc, tr),
+                        Status::Ok, "fill to capacity " + std::to_string(i));
+        CheckStatus(b.AddOrder(200, Side::Buy, 100, 1, TimeInForce::Gtc, tr),
+                    Status::CapacityExhausted, "past capacity");
+        CheckEq(b.OrderCount(), std::size_t{8}, "book held at capacity");
+
+        tr.clear();
+        CheckStatus(b.AddOrder(300, Side::Sell, 100, 8, TimeInForce::Ioc, tr),
+                    Status::Ok, "taker trades despite a full book");
+        CheckEq(tr.size(), std::size_t{8}, "all eight filled");
+        CheckEq(b.OrderCount(), std::size_t{0}, "book drained");
     }
     {
         g_case = "level-reuse-after-empty";
@@ -182,7 +269,8 @@ void UnitCases(const char* engine) {
         // rescan and the freelist.
         for (int i = 0; i < 100; ++i) {
             b.AddOrder(1000 + i, Side::Buy, 100 + (i % 7), 10, TimeInForce::Gtc, tr);
-            Check(b.CancelOrder(1000 + i), "cancel round " + std::to_string(i));
+            CheckStatus(b.CancelOrder(1000 + i), Status::Ok,
+                        "cancel round " + std::to_string(i));
             CheckEq(b.BestBid(), kNoBid, "empty after round " + std::to_string(i));
         }
         CheckEq(b.OrderCount(), std::size_t{0}, "no leaks");
@@ -194,7 +282,87 @@ void UnitCases(const char* engine) {
 // Differential: both engines see the same flow and must agree after every event.
 // ---------------------------------------------------------------------------
 
-bool Differential(std::uint64_t seed, std::size_t events) {
+// Applies one event and reports what the engine decided, so the comparison
+// covers the decision as well as its consequences.
+template <class Book>
+Status Apply(Book& b, const bench::Event& e, std::vector<Trade>& out) {
+    switch (e.op) {
+        case bench::Op::Add:
+            return b.AddOrder(e.id, e.side, e.price, e.qty, e.tif, out);
+        case bench::Op::Cancel:
+            return b.CancelOrder(e.id);
+        default:
+            return b.ModifyOrder(e.id, e.price, e.qty, out);
+    }
+}
+
+// Compares one engine against the reference after every event: the decision,
+// the trades, the touch, the live count, and finally the whole depth.
+template <class Ref, class Test>
+bool DifferentialPair(const char* label, const std::vector<bench::Event>& stream,
+                      const BookConfig& cfg, std::uint64_t seed) {
+    Ref  ref(cfg);
+    Test test(cfg);
+    std::vector<Trade> tr, tt;
+    std::vector<std::pair<Price, Qty>> rb, ra, tb, ta;
+    std::size_t rejected = 0;
+
+    for (std::size_t i = 0; i < stream.size(); ++i) {
+        const bench::Event& e = stream[i];
+        tr.clear();
+        tt.clear();
+
+        const Status sr = Apply(ref, e, tr);
+        const Status st = Apply(test, e, tt);
+        rejected += (sr != Status::Ok) ? 1 : 0;
+
+        if (sr != st) {
+            std::printf("  DIFF %s seed=%llu event %zu: status %s vs %s\n", label,
+                        (unsigned long long)seed, i, StatusName(sr), StatusName(st));
+            return false;
+        }
+        if (tr.size() != tt.size()) {
+            std::printf("  DIFF %s seed=%llu event %zu: %zu trades vs %zu\n", label,
+                        (unsigned long long)seed, i, tr.size(), tt.size());
+            return false;
+        }
+        for (std::size_t k = 0; k < tr.size(); ++k) {
+            if (!(tr[k] == tt[k])) {
+                std::printf("  DIFF %s seed=%llu event %zu trade %zu: %s vs %s\n",
+                            label, (unsigned long long)seed, i, k,
+                            TradeStr(tr[k]).c_str(), TradeStr(tt[k]).c_str());
+                return false;
+            }
+        }
+        if (ref.BestBid() != test.BestBid() || ref.BestAsk() != test.BestAsk()) {
+            std::printf("  DIFF %s seed=%llu event %zu: touch %lld/%lld vs %lld/%lld\n",
+                        label, (unsigned long long)seed, i, (long long)ref.BestBid(),
+                        (long long)ref.BestAsk(), (long long)test.BestBid(),
+                        (long long)test.BestAsk());
+            return false;
+        }
+        if (ref.OrderCount() != test.OrderCount()) {
+            std::printf("  DIFF %s seed=%llu event %zu: %zu orders vs %zu\n", label,
+                        (unsigned long long)seed, i, ref.OrderCount(),
+                        test.OrderCount());
+            return false;
+        }
+    }
+
+    ref.Snapshot(rb, ra);
+    test.Snapshot(tb, ta);
+    if (rb != tb || ra != ta) {
+        std::printf("  DIFF %s seed=%llu: final depth differs\n", label,
+                    (unsigned long long)seed);
+        return false;
+    }
+    std::printf("    %-22s ok  (%zu events, %zu refused, %zu/%zu levels)\n", label,
+                stream.size(), rejected, rb.size(), ra.size());
+    return true;
+}
+
+bool Differential(std::uint64_t seed, std::size_t events, Price tick,
+                  int pctInvalid, std::size_t maxOrders) {
     bench::FlowConfig flow;
     flow.seed = seed;
     flow.events = events;
@@ -202,91 +370,27 @@ bool Differential(std::uint64_t seed, std::size_t events) {
     flow.bandHigh = 20'000;
     flow.midStart = 10'000;
     flow.depthTicks = 32;
+    flow.tick = tick;
+    flow.pctInvalid = pctInvalid;
 
     BookConfig cfg;
     cfg.minPrice = flow.bandLow;
     cfg.maxPrice = flow.bandHigh;
-    cfg.tick = flow.tick;
-    cfg.maxOrders = 1u << 18;
+    cfg.tick = tick;
+    cfg.maxOrders = maxOrders;
 
     const std::vector<bench::Event> stream = bench::Generate(flow);
+    std::printf("  seed %llu, tick %lld, %d%% invalid, capacity %zu\n",
+                (unsigned long long)seed, (long long)tick, pctInvalid, maxOrders);
 
-    OrderBook base(cfg);
-    FastOrderBook fast(cfg);
-    std::vector<Trade> tb, tf;
-    std::vector<std::pair<Price, Qty>> bb, ba, fb, fa;
-
-    for (std::size_t i = 0; i < stream.size(); ++i) {
-        const bench::Event& e = stream[i];
-        tb.clear();
-        tf.clear();
-
-        switch (e.op) {
-            case bench::Op::Add:
-                base.AddOrder(e.id, e.side, e.price, e.qty, e.tif, tb);
-                fast.AddOrder(e.id, e.side, e.price, e.qty, e.tif, tf);
-                break;
-            case bench::Op::Cancel: {
-                const bool rb = base.CancelOrder(e.id);
-                const bool rf = fast.CancelOrder(e.id);
-                if (rb != rf) {
-                    std::printf("  DIFF seed=%llu event %zu: cancel returned %d vs %d\n",
-                                (unsigned long long)seed, i, rb, rf);
-                    return false;
-                }
-                break;
-            }
-            default: {
-                const bool rb = base.ModifyOrder(e.id, e.price, e.qty, tb);
-                const bool rf = fast.ModifyOrder(e.id, e.price, e.qty, tf);
-                if (rb != rf) {
-                    std::printf("  DIFF seed=%llu event %zu: modify returned %d vs %d\n",
-                                (unsigned long long)seed, i, rb, rf);
-                    return false;
-                }
-                break;
-            }
-        }
-
-        if (tb.size() != tf.size()) {
-            std::printf("  DIFF seed=%llu event %zu: %zu trades vs %zu\n",
-                        (unsigned long long)seed, i, tb.size(), tf.size());
-            return false;
-        }
-        for (std::size_t k = 0; k < tb.size(); ++k) {
-            if (!(tb[k] == tf[k])) {
-                std::printf("  DIFF seed=%llu event %zu trade %zu: %s vs %s\n",
-                            (unsigned long long)seed, i, k,
-                            TradeStr(tb[k]).c_str(), TradeStr(tf[k]).c_str());
-                return false;
-            }
-        }
-        if (base.BestBid() != fast.BestBid() || base.BestAsk() != fast.BestAsk()) {
-            std::printf("  DIFF seed=%llu event %zu: touch %lld/%lld vs %lld/%lld\n",
-                        (unsigned long long)seed, i, (long long)base.BestBid(),
-                        (long long)base.BestAsk(), (long long)fast.BestBid(),
-                        (long long)fast.BestAsk());
-            return false;
-        }
-        if (base.OrderCount() != fast.OrderCount()) {
-            std::printf("  DIFF seed=%llu event %zu: %zu orders vs %zu\n",
-                        (unsigned long long)seed, i, base.OrderCount(),
-                        fast.OrderCount());
-            return false;
-        }
-    }
-
-    // Full depth comparison at the end: every occupied level, both sides.
-    base.Snapshot(bb, ba);
-    fast.Snapshot(fb, fa);
-    if (bb != fb || ba != fa) {
-        std::printf("  DIFF seed=%llu: final depth differs (%zu/%zu vs %zu/%zu levels)\n",
-                    (unsigned long long)seed, bb.size(), ba.size(), fb.size(), fa.size());
-        return false;
-    }
-    std::printf("  seed %-10llu ok  (%zu events, %zu bid / %zu ask levels resting)\n",
-                (unsigned long long)seed, events, bb.size(), ba.size());
-    return true;
+    bool ok = true;
+    // The pooled baseline runs the identical algorithm over a different
+    // allocator, so any disagreement there is an allocator bug, not a logic one.
+    ok &= DifferentialPair<OrderBook, PooledOrderBook>("pooled vs baseline",
+                                                       stream, cfg, seed);
+    ok &= DifferentialPair<OrderBook, FastOrderBook>("fast vs baseline", stream,
+                                                     cfg, seed);
+    return ok;
 }
 
 }  // namespace
@@ -297,11 +401,21 @@ int main(int argc, char** argv) {
 
     std::printf("unit cases:\n");
     UnitCases<OrderBook>("baseline");
+    UnitCases<PooledOrderBook>("pooled");
     UnitCases<FastOrderBook>("optimized");
 
-    std::printf("\ndifferential (baseline vs optimized):\n");
-    for (std::uint64_t seed : {1ull, 7ull, 42ull, 0xC0FFEEull, 123456789ull}) {
-        if (!Differential(seed, events)) ++g_failures;
+    std::printf("\ndifferential:\n");
+    struct Case { std::uint64_t seed; Price tick; int invalid; std::size_t cap; };
+    // Non-unit ticks, deliberately inadmissible events, and a capacity small
+    // enough to be hit under load were all untested before, and all three had
+    // divergences hiding in them.
+    for (const Case& c : {Case{1, 1, 0, 1u << 18},
+                          Case{7, 1, 5, 1u << 18},
+                          Case{42, 1, 15, 1u << 18},
+                          Case{0xC0FFEE, 5, 5, 1u << 18},
+                          Case{123456789, 25, 10, 1u << 18},
+                          Case{31337, 1, 5, 4096}}) {
+        if (!Differential(c.seed, events / 2, c.tick, c.invalid, c.cap)) ++g_failures;
     }
 
     std::printf("\n%s\n", g_failures == 0 ? "ALL PASS" : "FAILURES PRESENT");

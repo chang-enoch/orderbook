@@ -28,7 +28,7 @@ FastOrderBook::FastOrderBook(const BookConfig& cfg)
 
     // Load factor stays at or below 50%, which keeps linear probes short.
     const std::size_t cap = NextPow2(std::max<std::size_t>(cfg.maxOrders, 16) * 2);
-    keys_.assign(cap, kEmpty);
+    keys_.assign(cap, kEmpty);  // kEmpty is the reserved max id, not zero
     vals_.assign(cap, kNull);
     mask_ = cap - 1;
 }
@@ -211,12 +211,10 @@ void FastOrderBook::Snapshot(std::vector<std::pair<Price, Qty>>& bids,
 }
 
 void FastOrderBook::Rest(OrderId id, Side side, Index idx, Qty qty) {
-    // The table must never fill: linear probing degrades badly past ~70% load,
-    // and a full table would not terminate at all. Rejecting past half-full is
-    // the same contract as the slab -- declared capacity is a hard limit.
-    if (liveOrders_ * 2 >= keys_.size()) return;
     const Handle h = Alloc();
-    if (h == kNull) return;  // slab exhausted
+    // Callers check AtCapacity() before committing, so this cannot fire; it is
+    // kept so a future caller that forgets cannot corrupt the slab silently.
+    if (h == kNull) return;
 
     OrderNode& n = nodes_[h];
     n.id = id;
@@ -299,7 +297,11 @@ Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
             if (maker.qty != 0) break;  // taker exhausted against this maker
 
             const Handle next = maker.next;
-            MapEraseAt(MapFind(maker.id));
+            const std::size_t slot = MapFind(maker.id);
+            // A resting order is always in the table; if it were not, erasing
+            // at kNoIdx would index the key array out of bounds.
+            assert(slot != kNoIdx);
+            MapEraseAt(slot);
             Free(h);
             --liveOrders_;
             h = next;
@@ -322,54 +324,77 @@ Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
     return qty;
 }
 
-std::size_t FastOrderBook::AddOrder(OrderId id, Side side, Price price, Qty qty,
-                                    TimeInForce tif, std::vector<Trade>& out) {
-    if (qty == 0 || !InBand(price) || MapFind(id) != kNoIdx) return 0;
+Status FastOrderBook::AddOrder(OrderId id, Side side, Price price, Qty qty,
+                               TimeInForce tif, std::vector<Trade>& out) {
+    const Status v = Admissible(id, price, qty);
+    if (v != Status::Ok) return v;
+    if (MapFind(id) != kNoIdx) return Status::DuplicateId;
 
-    const std::size_t before = out.size();
     const Qty remainder = Match(id, side, price, qty, out);
     if (remainder > 0 && tif == TimeInForce::Gtc) {
+        // Capacity gates *resting*, not admission. An aggressive order reduces
+        // the book, so a full book is no reason to refuse it the trades it
+        // would have made; only the remainder is turned away.
+        if (AtCapacity()) return Status::CapacityExhausted;
         Rest(id, side, PriceToIdx(price), remainder);
     }
-    return out.size() - before;
+    return Status::Ok;
 }
 
-bool FastOrderBook::CancelOrder(OrderId id) {
+Status FastOrderBook::CancelOrder(OrderId id) {
+    if (id == kReservedOrderId) return Status::ReservedId;
     const std::size_t slot = MapFind(id);
-    if (slot == kNoIdx) return false;
+    if (slot == kNoIdx) return Status::UnknownId;
 
     const Handle h = vals_[slot];
+    assert(h < nodes_.size());
     Unlink(h);
     Free(h);
     MapEraseAt(slot);      // the slot is already located; no second probe
     --liveOrders_;
-    return true;
+    return Status::Ok;
 }
 
-bool FastOrderBook::ModifyOrder(OrderId id, Price newPrice, Qty newQty,
-                                std::vector<Trade>& out) {
+Status FastOrderBook::ModifyOrder(OrderId id, Price newPrice, Qty newQty,
+                                  std::vector<Trade>& out) {
+    if (id == kReservedOrderId) return Status::ReservedId;
     const std::size_t slot = MapFind(id);
-    if (slot == kNoIdx) return false;
+    if (slot == kNoIdx) return Status::UnknownId;
 
     const Handle h = vals_[slot];
+    assert(h < nodes_.size());
     OrderNode& n = nodes_[h];
     const Side  side   = static_cast<Side>(n.side);
     const Qty   oldQty = n.qty;
     const Index oldIdx = n.level;
 
-    if (newQty == 0) return CancelOrder(id);
+    if (newQty == 0) {
+        CancelOrder(id);
+        return Status::Ok;
+    }
 
-    if (InBand(newPrice) && PriceToIdx(newPrice) == oldIdx) {
+    // Validate the replacement before destroying the original. Cancelling
+    // first and then failing the re-add deleted the order and returned
+    // success, which is how a reprice to an out-of-band or off-tick price
+    // used to make an order vanish.
+    const Status v = Admissible(id, newPrice, newQty);
+    if (v != Status::Ok) return v;
+
+    if (PriceToIdx(newPrice) == oldIdx) {
         if (newQty < oldQty) {
             // Size-down in place: keeps queue priority.
             levels_[oldIdx].qty -= (oldQty - newQty);
             n.qty = newQty;
-            return true;
+            return Status::Ok;
         }
-        if (newQty == oldQty) return true;
+        if (newQty == oldQty) return Status::Ok;
     }
 
     CancelOrder(id);
-    AddOrder(id, side, newPrice, newQty, TimeInForce::Gtc, out);
-    return true;
+    const Qty remainder = Match(id, side, newPrice, newQty, out);
+    if (remainder > 0) {
+        if (AtCapacity()) return Status::CapacityExhausted;
+        Rest(id, side, PriceToIdx(newPrice), remainder);
+    }
+    return Status::Ok;
 }

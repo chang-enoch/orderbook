@@ -7,25 +7,42 @@ containers, correct and readable. The other is laid out for the cache.
 The question the project exists to answer: **how much does careful C++ data-structure and
 memory design actually buy you at p99?**
 
-|            | baseline    | optimized   |          |
-| ---------- | ----------- | ----------- | -------- |
-| mean       | 58.7 ns     | 18.0 ns     | **3.3×** |
-| p99        | 167 ns      | 42 ns       | **4.0×** |
-| p99.9      | 209 ns      | 83 ns       | **2.5×** |
-| p99.99     | 333 ns      | 125 ns      | **2.7×** |
-| throughput† | 16.5M ops/s | 61.9M ops/s | **3.8×** |
+Headline, on an Apple M3 (arm64, clang 21, `-O3 -march=native`, C++20):
 
-Apple M3 (arm64), Apple clang 21, `-O3 -march=native`, C++20. 4M generated events,
-400k untimed warm-up, 7 repetitions reporting the median run by p99. Both engines
-produce **identical trades**.
+| ns per operation | baseline | pooled baseline | optimized |
+| ---------------- | -------- | --------------- | --------- |
+| batched timing   | 60.0     | 36.3            | **15.7**  |
+| throughput       | 16.6M/s  | 27.1M/s         | **60.6M/s** |
+| vs. baseline     | —        | 1.64×           | **3.66×** |
 
-† Throughput is measured on a separate pass *without* per-operation
-instrumentation, reported at the end of `orderbook_bench`. The latency harness
-brackets every operation with two clock reads to build the distribution — on this
-machine a clock read costs about as much as a book operation, so the ops/sec that
-falls out of the timed loop (13.6 / 30.4 M ops/s) is instrumentation-bound rather
-than engine-bound. Both engines pay the same overhead, so the percentile comparison
-is unaffected; the throughput comparison needs its own untimed pass.
+**Read the middle column first.** "Pooled baseline" is the baseline's exact
+algorithm and container shapes over a freelist allocator instead of `malloc`. It
+recovers 1.64× of the 3.66× total, which means roughly *half* the win is simply not
+calling the general-purpose allocator, and the other half is the cache-friendly
+layout. Without that control, the two are indistinguishable and the project's thesis
+is unsupported.
+
+### What is not measurable here
+
+Per-operation latency on this machine is quantized to a 41.7 ns timer tick, and the
+benchmark reports a **null-book control** — the identical timing loop over an engine
+that does nothing — so you can see the floor:
+
+| ns, per-operation timing | mean | p50   | p99 | p99.9 |
+| ------------------------ | ---- | ----- | --- | ----- |
+| null book (harness only) | 13.0 | < 42  | 42  | 42    |
+| baseline                 | 58.4 | 42    | 167 | 250   |
+| pooled baseline          | 35.1 | 42    | 84  | 125   |
+| optimized                | 19.0 | < 42  | 42  | 84    |
+
+The optimized engine's p99 is **42 ns — one tick, identical to the empty harness.**
+Per-operation timing cannot resolve it on this hardware. An earlier version of this
+README reported that as a "4.0× p99 improvement"; it was a ratio of tick counts, not
+a measurement, and it is gone. Where a percentile is genuinely needed, the batched
+and throughput tables are the ones that survive a machine with a different tick.
+
+Both engines produce identical trades, and a differential test checks that after
+every event.
 
 ## Build and run
 
@@ -71,7 +88,18 @@ Both books implement the same rules:
 - `Gtc` rests any unfilled remainder; `Ioc` discards it.
 - **Modify:** a quantity decrease at the same price keeps queue priority. A price change or
   a quantity increase is a cancel/replace to the back of the new level's queue, and may cross.
-- Duplicate ids and zero quantities are rejected.
+- Every call returns a `Status`. A trade count cannot distinguish "refused" from
+  "matched nothing", and without that distinction the two engines disagreed silently
+  on five separate cases.
+- Both engines enforce the same admission rules from `BookConfig`: price band, tick
+  alignment, `maxOrders`, no duplicate ids, no zero quantities, and one reserved id
+  (`UINT64_MAX`). The baseline has no structural need for a price band; it enforces
+  one anyway so that "identical semantics" is a testable claim.
+- **Capacity gates resting, not admission.** An aggressive order reduces the book, so
+  a full book is no reason to refuse it the trades it would have made; only the
+  remainder is turned away.
+- **A refused modify leaves the order untouched.** Validation happens before anything
+  is destroyed.
 
 ## The two designs
 
@@ -108,9 +136,15 @@ for the same reason.
 
 ## Findings
 
-The four structural changes were the easy part. Everything interesting came from three
-problems that only showed up under measurement, each of which made the "optimized" engine
-_slower_ than the one it was replacing.
+The four structural changes were the easy part. Everything interesting came from problems
+that only showed up under measurement — two of which made the "optimized" engine _slower_
+than the one it was replacing, and one of which showed that half the remaining win was not
+what it looked like.
+
+The tail figures in findings 1 and 2 are per-operation percentiles, so they carry the
+resolution caveat from the top of this file: the large numbers (thousands of ns) span many
+ticks and are solid, while any figure at 42 ns is at the harness floor and should be read as
+"below one tick".
 
 ### 1. A flat bitmap is a trap at the touch
 
@@ -128,6 +162,12 @@ The three-level bitmap turns any gap into roughly three loads.
 | hierarchical bitmap        | 125 ns   |
 | _baseline, for comparison_ | _167 ns_ |
 
+To be precise about the mechanism, since it is easy to state loosely: the pathological case
+is a side going **entirely empty**, where the scan runs to the end of a million-tick bitmap.
+A large gap between two occupied levels costs the same way, but the default tape keeps orders
+within 64 ticks of the mid and so rarely produces one — which is why this only surfaced under
+an all-aggressive tape, and why the benign tape is listed under Known gaps.
+
 ### 2. Tombstones quietly destroy an open-addressed table
 
 Erasing by tombstoning is textbook, and it looked fine at 1.5M events. At 4M it collapsed.
@@ -138,12 +178,35 @@ and lookups decay toward a full-table scan.
 Backward-shift deletion (Knuth 6.4 algorithm R) keeps each cluster a contiguous probe chain
 and needs no tombstone at all.
 
-| add            | mean    | p99    |
-| -------------- | ------- | ------ |
-| tombstones     | 85.8 ns | 791 ns |
-| backward-shift | 18.6 ns | 42 ns  |
+| add            | mean    | p99                  |
+| -------------- | ------- | -------------------- |
+| tombstones     | 85.8 ns | 791 ns               |
+| backward-shift | 18.6 ns | 42 ns (harness floor) |
 
-### 3. Over-provisioning capacity costs a third of the throughput
+The mean is the load-bearing number in that table. The p99 improvement is real but its
+magnitude is not measurable here — 42 ns is what the empty harness reports.
+
+### 3. Roughly half the win is the allocator, not the layout
+
+The baseline heap-allocates a list node per resting order and a red-black node per
+price level; the optimized book preallocates everything. That confounds two claims
+— "laid out for the cache" and "stopped calling malloc" — and only a control
+separates them.
+
+`PooledOrderBook` is the control: `BasicOrderBook` instantiated over a freelist
+allocator instead of `std::allocator`. Same code, same containers, same algorithm.
+
+| | ns/op (batched) | throughput |
+|---|---|---|
+| baseline | 60.0 | 16.6M/s |
+| + pool allocator only | 36.3 | 27.1M/s |
+| + flat/arena/bitmap layout | 15.7 | 60.6M/s |
+
+Pooling alone buys 1.64×. The layout buys a further 2.23× on top of it. Both are
+real, and the honest summary is "half allocator, half layout" rather than the
+cache-first story the earlier version of this README told.
+
+### 4. Over-provisioning capacity costs a third of the throughput
 
 The flat design pays for its speed in sizing discipline. Declaring capacity for 1M live
 orders when only ~65k are ever resting spreads the id table across 32MB, and every probe
@@ -169,12 +232,19 @@ distribution, at scale, against a reference implementation known to be right.
 
 Two things about the harness are worth knowing before trusting any number here.
 
-**Timer resolution.** Userspace timing on Apple Silicon runs off a 24MHz counter, so every
-individual sample is quantized to a multiple of ~41.7ns. The tails span many ticks and are
-measured properly, and the mean stays honest because the clock is asynchronous to the work so
-the quantization error dithers out. But the optimized engine's p50 reads _zero ticks_ — it is
-genuinely below what this machine can time per operation. Read its p50 as "under 42ns", not
-as a number.
+**Timer resolution, and the null-book control.** Userspace timing on Apple Silicon runs off a
+24MHz counter, so every per-operation sample is a multiple of ~41.7 ns, and nothing finer is
+available without kernel support. Rather than assert that this is fine, the benchmark measures
+it: a null book with the same interface and no work runs through the identical timing loop, and
+its distribution is printed as the first row of the latency table. It reports mean 13 ns and
+p99 42 ns — so any engine row at 42 ns is reporting the harness, not itself.
+
+That is why the headline numbers come from two other measurements. **Batched timing** puts 64
+operations inside one clock pair, so the per-operation cost is derived from a span many ticks
+long; it cannot show a tail, but its central estimate does not sit on the floor. **Untimed
+throughput** removes the instrumentation entirely. Both are reported for every engine, both
+carry the null control, and both are the numbers to use when comparing against a machine with
+a different tick.
 
 **Order flow is generated against a scratch book.** The generator drives a real baseline book
 during generation so it knows exactly which orders are still resting. Without that, most
@@ -185,29 +255,54 @@ Generation happens entirely ahead of the timed run.
 **Everything is preallocated.** The event vector, the trade sink, and the sample storage are
 all allocated before timing starts. Nothing allocates, sorts, or prints inside a timed region.
 
+**Engines are interleaved, not run in blocks.** Each repetition runs every engine once, so
+thermal and scheduler drift over the life of the process cannot masquerade as a difference
+between them. Latency is the median run by p99; throughput is the median of the same number
+of repetitions. There is no core pinning — macOS does not offer it — so the far tail still
+contains scheduler noise, which is what the max column mostly measures.
+
 ## Correctness
 
-`tests/conformance.cpp` is what makes the benchmark mean anything. It runs hand-written
-matching cases against both engines (FIFO sweep, multi-level sweep, partial rest, IOC
-remainder, modify-keeps-priority, modify-loses-priority, reprice-crosses, level reuse), then
-drives both over the same tape across five seeds, comparing **after every single event**:
+`tests/conformance.cpp` is what makes the benchmark mean anything. It runs hand-written cases
+against all three engines — FIFO sweep, multi-level sweep, partial rest, IOC remainder,
+modify-keeps-priority, modify-loses-priority, reprice-crosses, level reuse — plus the
+admission rules that used to diverge silently: id zero, the reserved id, out-of-band prices,
+off-tick prices, capacity exhaustion, and a refused modify leaving its order intact.
 
+It then drives every engine over the same tape, comparing **after every single event**:
+
+- the returned `Status` — the decision, not just its consequences
 - the full trade sequence — taker, maker, price, quantity, in order
-- best bid and best ask
-- the live order count
+- best bid and best ask, and the live order count
 
-and finally the complete depth on both sides. A faster book that matches differently is not
-a faster book.
+and finally the complete depth on both sides. The tape is generated at tick sizes 1, 5, and
+25, with 0–15% of events deliberately made inadmissible, and at a capacity small enough to be
+hit under load. Every one of those axes was untested previously, and every one of them had a
+divergence hiding in it: the earlier suite passed only because the generator clamped
+everything into range and started ids at 1.
+
+A faster book that matches differently is not a faster book.
 
 ## Known gaps
 
-- **Per-optimization attribution.** The results show the finished engine versus the baseline,
-  and show how much each defect _cost_, but not how much each of the four structural changes
-  individually _contributes_. That would need four compile-time variants measured in isolation.
+- **Per-optimization attribution within the fast book.** The allocator is now
+  separated from the layout, but the four structural changes inside the optimized
+  book — flat levels, hierarchical bitmap, slab arena, open addressing — are still
+  measured only as a bundle.
+- **The tape is benign.** Mid random-walks one tick at a time and orders rest within
+  64 ticks of it, so the working set is ~128 levels and stays cache-resident. There
+  are no gap-ups, halts, wide spreads, or arrival bursts, which means the deep-scan
+  case that finding #1 is about is under-exercised in the default workload.
+- **No core pinning or frequency control.** macOS offers no thread pinning, this runs
+  on a laptop under a desktop OS, and no attempt is made to fix clocks. Engines are
+  interleaved rep-by-rep and reported as a median to keep drift from masquerading as
+  a difference, but the far tail is still partly the scheduler.
+- **The numbers are machine-specific.** Ratios measured here have been reported
+  differently on other microarchitectures. The batched and throughput tables are the
+  ones worth comparing across machines; the per-operation percentiles are not.
+- **One reserved order id.** `UINT64_MAX` is the hash table's empty sentinel and is
+  refused by both engines with `Status::ReservedId`. Every other id, including zero,
+  is legal.
 - **Single-threaded.** No concurrency work. A real deployment would put a lock-free
   SPSC ring in front of a pinned matching thread; the matching core itself stays
   single-threaded either way, which is how real books do it.
-- **Slab exhaustion is silent.** `Rest()` drops the order if the arena or table is full rather
-  than signalling. Fine for a benchmark, wrong for anything real.
-- `orderbook_test` inherits `-O3` from the library target in CMake Release builds. The
-  sanitizer build is a separate `Debug` tree, so this only affects stack-trace readability.

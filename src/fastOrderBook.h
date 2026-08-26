@@ -25,11 +25,11 @@ class FastOrderBook {
 public:
     explicit FastOrderBook(const BookConfig& cfg = {});
 
-    std::size_t AddOrder(OrderId id, Side side, Price price, Qty qty,
-                         TimeInForce tif, std::vector<Trade>& out);
-    bool        CancelOrder(OrderId id);
-    bool        ModifyOrder(OrderId id, Price newPrice, Qty newQty,
-                            std::vector<Trade>& out);
+    Status AddOrder(OrderId id, Side side, Price price, Qty qty,
+                    TimeInForce tif, std::vector<Trade>& out);
+    Status CancelOrder(OrderId id);
+    Status ModifyOrder(OrderId id, Price newPrice, Qty newQty,
+                       std::vector<Trade>& out);
 
     Price BestBid() const {
         return bestBid_ == kNoIdx ? kNoBid : IdxToPrice(bestBid_);
@@ -117,6 +117,12 @@ private:
     // halves the bytes the probe walks and puts twice as many candidate keys on
     // each cache line; the handle is touched once, on the slot that matched.
     //
+    // The empty-slot sentinel is the maximum OrderId, not zero. Zero is an
+    // ordinary id for a feed to send, and using it as the sentinel meant an
+    // empty slot compared equal to it: AddOrder(0, ...) was refused as a
+    // duplicate, and CancelOrder(0) then indexed the node slab with kNull and
+    // read out of bounds. Both engines now reject the one reserved id.
+    //
     // Erase uses backward-shift deletion, not tombstones. Tombstones look
     // harmless at first and then quietly destroy this table: an exchange feed
     // inserts far more orders over a session than the table has slots, so every
@@ -124,7 +130,7 @@ private:
     // slot again, and lookups decay toward a full-table scan. Shifting the
     // following cluster back on erase keeps probe chains genuinely bounded, at
     // the cost of a short bounded loop on erase.
-    static constexpr OrderId kEmpty = 0;
+    static constexpr OrderId kEmpty = kReservedOrderId;
 
     static std::uint64_t Hash(OrderId id) {
         // splitmix64 finalizer: cheap, and it scrambles the sequential ids that
@@ -138,6 +144,21 @@ private:
     std::size_t MapFind(OrderId id) const;
     void        MapInsert(OrderId id, Handle h);
     void        MapEraseAt(std::size_t slot);
+
+    // The admission rules, identical to the baseline's.
+    Status Admissible(OrderId id, Price price, Qty qty) const {
+        if (id == kReservedOrderId) return Status::ReservedId;
+        if (qty == 0) return Status::ZeroQty;
+        if (price < minPrice_ || price > maxPrice_) return Status::PriceOutOfBand;
+        if (tick_ != 1 && (price - minPrice_) % tick_ != 0)
+            return Status::PriceNotOnTick;
+        return Status::Ok;
+    }
+    bool AtCapacity() const {
+        // The probe loop does not terminate on a full table, and linear probing
+        // degrades badly past ~70% load, so half-full is a hard limit.
+        return liveOrders_ >= nodes_.size() || liveOrders_ * 2 >= keys_.size();
+    }
 
     // --- matching ------------------------------------------------------------
     Qty  Match(OrderId taker, Side side, Price limit, Qty qty,

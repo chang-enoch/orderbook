@@ -10,6 +10,42 @@ using OrderId = std::uint64_t;
 
 enum class Side : std::uint8_t { Buy, Sell };
 
+// Every book operation reports why it was accepted or refused. Without this,
+// "rejected" and "matched nothing" are the same answer, and an engine can
+// destroy an order while reporting success -- which is exactly how the two
+// implementations here were able to disagree silently.
+enum class Status : std::uint8_t {
+    Ok,
+    DuplicateId,
+    UnknownId,
+    ReservedId,
+    ZeroQty,
+    PriceOutOfBand,
+    PriceNotOnTick,
+    CapacityExhausted,
+};
+
+inline const char* StatusName(Status s) {
+    switch (s) {
+        case Status::Ok:                return "ok";
+        case Status::DuplicateId:       return "duplicate-id";
+        case Status::UnknownId:         return "unknown-id";
+        case Status::ReservedId:        return "reserved-id";
+        case Status::ZeroQty:           return "zero-qty";
+        case Status::PriceOutOfBand:    return "price-out-of-band";
+        case Status::PriceNotOnTick:    return "price-not-on-tick";
+        case Status::CapacityExhausted: return "capacity-exhausted";
+    }
+    return "?";
+}
+
+// The optimized book's open-addressed table needs one OrderId value to mean
+// "empty slot". Reserving the maximum rather than zero matters: zero is a
+// perfectly ordinary id for a feed to send, and using it as the sentinel made
+// AddOrder silently reject it and CancelOrder read out of bounds. Both engines
+// reject this one id explicitly so the rule is visible and testable.
+inline constexpr OrderId kReservedOrderId = std::numeric_limits<OrderId>::max();
+
 // Gtc: any unfilled remainder rests on the book.
 // Ioc: any unfilled remainder is discarded.
 enum class TimeInForce : std::uint8_t { Gtc, Ioc };

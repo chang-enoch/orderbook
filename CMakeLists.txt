@@ -13,7 +13,7 @@ endif()
 option(ENABLE_SANITIZERS "Build with ASan + UBSan" OFF)
 option(ENABLE_NATIVE "Tune for the host CPU" ON)
 
-add_library(orderbook STATIC src/orderBook.cpp src/fastOrderBook.cpp)
+add_library(orderbook STATIC src/fastOrderBook.cpp)
 target_include_directories(orderbook PUBLIC src)
 target_compile_options(orderbook PRIVATE -Wall -Wextra)
 
