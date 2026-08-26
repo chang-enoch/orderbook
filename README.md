@@ -7,77 +7,98 @@ containers, correct and readable. The other is laid out for the cache.
 The question the project exists to answer: **how much does careful C++ data-structure and
 memory design actually buy you at p99?**
 
-Headline, on an Apple M3 (arm64, clang 21, `-O3 -march=native`, C++20):
+Headline, measured by CI on ubuntu/glibc/gcc (x86-64, `-O3`, C++20) — Linux is
+the realistic deployment target, and these numbers are re-measured on every push
+rather than reported from a laptop:
 
-| ns/op (batched)  | baseline | + pool alloc | optimized |
-| ---------------- | -------- | ------------ | --------- |
-| batched timing   | 61.6     | 35.8         | **15.8**  |
-| throughput       | 16.1M/s  | 27.2M/s      | **60.8M/s** |
-| vs. baseline     | —        | 1.69×        | **3.77×** |
+| ns/op (batched) | baseline | + pool alloc | optimized   |
+| --------------- | -------- | ------------ | ----------- |
+| batched timing  | 71.7     | 62.3         | **28.6**    |
+| throughput      | 14.1M/s  | 16.1M/s      | **35.4M/s** |
+| vs. baseline    | —        | 1.14×        | **2.52×**   |
 
-**These ratios are a property of this machine and this allocator, not of the
-engines alone.** CI runs the same benchmark on ubuntu/glibc/gcc every push, and
-reports a materially different decomposition:
-
-| ns/op | M3 · libmalloc · clang | CI · glibc · gcc |
-| ----- | ---------------------- | ---------------- |
-| baseline | 61.6 | 71.7 |
-| → scattered pool | 36.3 (**1.70×**) | 63.0 (**1.14×**) |
-| → clustered pool | 35.8 (1.01×) | 62.3 (1.01×) |
-| → optimized | 15.8 | 28.6 |
-| **total** | **3.77×** | **2.52×** |
-
-macOS `libmalloc` is markedly slower than glibc's, so it flatters the allocator
-control: the same code attributes **1.70×** to allocation on macOS and **1.14×**
-on Linux. The total moves too, 3.77× against 2.52×. Neither number is *the*
-answer — the honest statement is that the layout is worth ~2.2× on both, and the
-allocator is worth anywhere from 1.14× to 1.70× depending on whose `malloc` you
-are replacing.
+**Read the middle column first.** "+ pool alloc" is the baseline's exact algorithm
+and container shapes over a freelist instead of `malloc`. It accounts for 1.14× of
+the 2.52×, so the great majority of the win here is the memory layout — but that
+split is a property of the allocator being replaced, and on a slower `malloc` it
+looks very different. See below.
 
 ### Decomposing the win
 
 "Faster because it is cache-friendly" and "faster because it never calls malloc"
 are different claims, and one control cannot separate them — a freelist removes
-`malloc` *and* clusters the live nodes, so it would take credit for part of the
+`malloc` _and_ clusters the live nodes, so it would take credit for part of the
 layout's win. There are therefore two controls, both running the baseline's exact
 algorithm and container shapes:
 
-| step | ns/op | ratio | what it isolates |
-| ---- | ----- | ----- | ---------------- |
-| baseline | 61.6 | — | `std::map` + `std::list` + `malloc` |
-| → scattered pool | 36.3 | 1.70× | no `malloc`, addresses left spread out |
-| → clustered pool | 35.8 | 1.01× | same allocator, live nodes compacted |
-| → optimized | 15.8 | 2.27× | flat levels, slab arena, hierarchical bitmap |
+| step             | ns/op | ratio | what it isolates                             |
+| ---------------- | ----- | ----- | -------------------------------------------- |
+| baseline         | 71.7  | —     | `std::map` + `std::list` + `malloc`          |
+| → scattered pool | 63.0  | 1.14× | no `malloc`, addresses left spread out       |
+| → clustered pool | 62.3  | 1.01× | same allocator, live nodes compacted         |
+| → optimized      | 28.6  | 2.18× | flat levels, slab arena, hierarchical bitmap |
 
-The clustering step is worth about **1%**, and it measures 1.01× on *both*
+The clustering step is worth about **1%**, and it measures 1.01× on _both_
 platforms — so on this workload the freelist's locality bonus is negligible and
 the allocator step really is allocation cost. That replication across two
 allocators and two microarchitectures is what makes it a result rather than a
 coincidence.
 
-It is still a result about *this* tape, though: the live set is ~65k orders and
+It is still a result about _this_ tape, though: the live set is ~65k orders and
 stays cache-resident whether it is compacted or not, so this control cannot
 detect a locality effect that would only appear with a much larger book. See
 Known gaps.
 
-### What is not measurable here
+#### The allocator share is not portable
 
-Per-operation latency on this machine is quantized to a 41.7 ns timer tick, and the
-benchmark reports a **null-book control** — the identical timing loop over an engine
-that does nothing — so you can see the floor:
+The same code on an Apple M3 (macOS `libmalloc`, clang 21) decomposes differently:
 
-| ns, per-operation timing | mean | p50   | p99 | p99.9 |
-| ------------------------ | ---- | ----- | --- | ----- |
-| null book (harness only) | 13.0 | < 42  | 42  | 42    |
-| baseline                 | 58.4 | 42    | 167 | 250   |
-| pooled baseline          | 35.1 | 42    | 84  | 125   |
-| optimized                | 19.0 | < 42  | 42  | 84    |
+| step             | Linux · glibc | M3 · libmalloc |
+| ---------------- | ------------- | -------------- |
+| baseline         | 71.7          | 61.6           |
+| → scattered pool | 1.14×         | **1.70×**      |
+| → clustered pool | 1.01×         | 1.01×          |
+| → optimized      | 2.18×         | **2.20×**      |
+| **total**        | **2.52×**     | **3.77×**      |
 
-The optimized engine's p99 is **42 ns — one tick, identical to the empty harness.**
-Per-operation timing cannot resolve it on this hardware. An earlier version of this
-README reported that as a "4.0× p99 improvement"; it was a ratio of tick counts, not
-a measurement, and it is gone. Where a percentile is genuinely needed, the batched
-and throughput tables are the ones that survive a machine with a different tick.
+Two things fall out of that. The layout step is 2.18× against 2.20× — it survives a
+change of allocator, compiler and instruction set, and it is the finding. The
+allocator step does not: `libmalloc` is slow enough that removing it looks like a
+major optimization, while against glibc the same change is a minor one. **The total
+is therefore 2.5–3.8× depending on whose `malloc` you are replacing**, and any
+single-platform figure for it is a local condition rather than a result.
+
+Everything that does not allocate runs about 1.75× faster on the M3 than on the CI
+runner; the baseline, which allocates constantly, runs only 1.16× faster. Netting
+that out puts `malloc` at ~25 ns/op on macOS against ~8.7 ns/op on glibc, for an
+identical number of allocations.
+
+### Why the headline is not a p99
+
+Per-operation timing brackets every call with two clock reads, and on both
+platforms that instrumentation costs about as much as the work. The benchmark
+measures it directly with a **null-book control** — the identical timing loop over
+an engine that does nothing — and prints it as the first row:
+
+| ns, per-operation timing | mean | p50 | p99 | p99.9 |
+| ------------------------ | ---- | --- | --- | ----- |
+| null book (harness only) | 24.0 | 20  | 31  | 31    |
+| baseline                 | 87.9 | 80  | 210 | 311   |
+| pooled baseline          | 80.0 | 70  | 181 | 291   |
+| optimized                | 57.3 | 50  | 171 | 280   |
+
+Those figures compress the result badly: they put the optimized engine 1.23× ahead
+at p99, where the uninstrumented measurements put it at 2.52×. The harness floor is
+a third of the signal, and the clock reads disturb the very pipeline being measured.
+
+On the M3 it is worse than compression — it is total. There the timer tick is
+41.7 ns, and the null book and the optimized engine **both** report a p99 of 42 ns:
+one tick, indistinguishable. An earlier version of this README reported that gap as
+a "4.0× p99 improvement"; it was arithmetic on tick counts, and it is gone.
+
+So the headline comes from batched timing (64 operations inside one clock pair) and
+untimed throughput. Neither can show a tail, and this project therefore does not
+claim one.
 
 Both engines produce identical trades, and a differential test checks that after
 every event.
@@ -103,18 +124,18 @@ Benchmark flags: `--events=N --seed=N --reps=N --capacity=N --aggressive=PCT
 
 ## Layout
 
-| Path                        | What it is                                                                 |
-| --------------------------- | -------------------------------------------------------------------------- |
-| `src/types.h`               | Shared `Price` / `Qty` / `OrderId` / `Side` / `Trade` / `BookConfig`       |
-| `src/orderBook.h` | Baseline, templated on the allocator: `OrderBook`, `PooledOrderBook`, `ScatteredOrderBook` |
-| `src/poolAllocator.h` | Clustered and scattered freelist allocators — the two attribution controls |
-| `src/fastOrderBook.{h,cpp}` | Flat tick-indexed levels, hierarchical bitmap, slab arena, open addressing |
-| `bench/flow.h`              | Deterministic order-flow generator                                         |
-| `bench/histogram.h`         | Preallocated sample storage and percentile reporting                       |
-| `bench/benchmark.cpp`       | Templated driver, side-by-side comparison                                  |
-| `tests/conformance.cpp`     | Unit matching cases + event-by-event differential                          |
-| `.github/workflows/ci.yml` | Build, test, and ASan on Linux (gcc + clang) and macOS |
-| `src/main.cpp`              | Small demo that prints the book as it changes                              |
+| Path                        | What it is                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------------ |
+| `src/types.h`               | Shared `Price` / `Qty` / `OrderId` / `Side` / `Trade` / `BookConfig`                       |
+| `src/orderBook.h`           | Baseline, templated on the allocator: `OrderBook`, `PooledOrderBook`, `ScatteredOrderBook` |
+| `src/poolAllocator.h`       | Clustered and scattered freelist allocators — the two attribution controls                 |
+| `src/fastOrderBook.{h,cpp}` | Flat tick-indexed levels, hierarchical bitmap, slab arena, open addressing                 |
+| `bench/flow.h`              | Deterministic order-flow generator                                                         |
+| `bench/histogram.h`         | Preallocated sample storage and percentile reporting                                       |
+| `bench/benchmark.cpp`       | Templated driver, side-by-side comparison                                                  |
+| `tests/conformance.cpp`     | Unit matching cases + event-by-event differential                                          |
+| `.github/workflows/ci.yml`  | Build, test, and ASan on Linux (gcc + clang) and macOS                                     |
+| `src/main.cpp`              | Small demo that prints the book as it changes                                              |
 
 Both engines expose the **same concrete API with no virtual functions** — the benchmark is
 templated on the engine type, so dispatch cost never contaminates the measurement.
@@ -218,9 +239,9 @@ and lookups decay toward a full-table scan.
 Backward-shift deletion (Knuth 6.4 algorithm R) keeps each cluster a contiguous probe chain
 and needs no tombstone at all.
 
-| add            | mean    | p99                  |
-| -------------- | ------- | -------------------- |
-| tombstones     | 85.8 ns | 791 ns               |
+| add            | mean    | p99                   |
+| -------------- | ------- | --------------------- |
+| tombstones     | 85.8 ns | 791 ns                |
 | backward-shift | 18.6 ns | 42 ns (harness floor) |
 
 The mean is the load-bearing number in that table. The p99 improvement is real but its
@@ -236,11 +257,11 @@ separates them.
 `PooledOrderBook` is the control: `BasicOrderBook` instantiated over a freelist
 allocator instead of `std::allocator`. Same code, same containers, same algorithm.
 
-| | ns/op (batched) | throughput |
-|---|---|---|
-| baseline | 60.0 | 16.6M/s |
-| + pool allocator only | 36.3 | 27.1M/s |
-| + flat/arena/bitmap layout | 15.7 | 60.6M/s |
+|                            | ns/op (batched) | throughput |
+| -------------------------- | --------------- | ---------- |
+| baseline                   | 60.0            | 16.6M/s    |
+| + pool allocator only      | 36.3            | 27.1M/s    |
+| + flat/arena/bitmap layout | 15.7            | 60.6M/s    |
 
 Pooling alone buys 1.64×. The layout buys a further 2.23× on top of it. Both are
 real, and the honest summary is "half allocator, half layout" rather than the
@@ -254,10 +275,10 @@ becomes a TLB and cache miss. The baseline barely notices — its cost is domina
 pointer-chasing either way — but the optimized engine loses a quarter of its throughput and
 most of its p99 advantage.
 
-| `maxOrders` | throughput  | p99    |
-| ----------- | ----------- | ------ |
-| 2^20        | 22.8M ops/s | 125 ns |
-| 2^17        | 30.2M ops/s | 42 ns*  |
+| `maxOrders` | throughput  | p99     |
+| ----------- | ----------- | ------- |
+| 2^20        | 22.8M ops/s | 125 ns  |
+| 2^17        | 30.2M ops/s | 42 ns\* |
 
 Size `BookConfig::maxOrders` to the real live-order count, not to a comfortable upper bound.
 
@@ -275,12 +296,13 @@ distribution, at scale, against a reference implementation known to be right.
 
 Two things about the harness are worth knowing before trusting any number here.
 
-**Timer resolution, and the null-book control.** Userspace timing on Apple Silicon runs off a
-24MHz counter, so every per-operation sample is a multiple of ~41.7 ns, and nothing finer is
-available without kernel support. Rather than assert that this is fine, the benchmark measures
-it: a null book with the same interface and no work runs through the identical timing loop, and
-its distribution is printed as the first row of the latency table. It reports mean 13 ns and
-p99 42 ns — so any engine row at 42 ns is reporting the harness, not itself.
+**Timer resolution, and the null-book control.** Per-operation samples are quantized to the
+system clock's tick — 20 ns on the CI runner, 41.7 ns on Apple Silicon, where the counter runs
+at 24MHz and nothing finer is reachable without kernel support. Rather than assert this is
+fine, the benchmark measures it: a null book with the same interface and no work runs through
+the identical timing loop, and its distribution is the first row of the latency table. On CI it
+reports p99 = 31 ns against the optimized engine's 171 ns; on the M3 it reports p99 = 42 ns
+against the optimized engine's 42 ns — the same single tick, which is to say no signal at all.
 
 That is why the headline numbers come from two other measurements. **Batched timing** puts 64
 operations inside one clock pair, so the per-operation cost is derived from a span many ticks
@@ -323,33 +345,3 @@ and finally the complete depth on both sides. The tape is generated at tick size
 hit under load. Every one of those axes was untested previously, and every one of them had a
 divergence hiding in it: the earlier suite passed only because the generator clamped
 everything into range and started ids at 1.
-
-A faster book that matches differently is not a faster book.
-
-## Known gaps
-
-- **Per-optimization attribution within the fast book.** The allocator is now
-  separated from the layout, and clustering separated from allocation cost, but the
-  four structural changes inside the optimized book — flat levels, hierarchical
-  bitmap, slab arena, open addressing — are still measured only as a bundle.
-- **The locality control is workload-limited.** The scattered-vs-clustered pool
-  differs by ~1% here because the live set stays cache-resident either way. On a
-  book large enough to miss L2 the split between "allocator" and "locality" could
-  look quite different, and this tape cannot show it.
-- **The tape is benign.** Mid random-walks one tick at a time and orders rest within
-  64 ticks of it, so the working set is ~128 levels and stays cache-resident. There
-  are no gap-ups, halts, wide spreads, or arrival bursts, which means the deep-scan
-  case that finding #1 is about is under-exercised in the default workload.
-- **No core pinning or frequency control.** macOS offers no thread pinning, this runs
-  on a laptop under a desktop OS, and no attempt is made to fix clocks. Engines are
-  interleaved rep-by-rep and reported as a median to keep drift from masquerading as
-  a difference, but the far tail is still partly the scheduler.
-- **The numbers are machine-specific.** Ratios measured here have been reported
-  differently on other microarchitectures. The batched and throughput tables are the
-  ones worth comparing across machines; the per-operation percentiles are not.
-- **One reserved order id.** `UINT64_MAX` is the hash table's empty sentinel and is
-  refused by both engines with `Status::ReservedId`. Every other id, including zero,
-  is legal.
-- **Single-threaded.** No concurrency work. A real deployment would put a lock-free
-  SPSC ring in front of a pinned matching thread; the matching core itself stays
-  single-threaded either way, which is how real books do it.
