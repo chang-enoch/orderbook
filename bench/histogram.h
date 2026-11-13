@@ -1,9 +1,10 @@
 #pragma once
 
+#include "flow.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <vector>
 
 namespace bench {
@@ -16,24 +17,25 @@ inline void DoNotOptimize(const T& value) {
     asm volatile("" : : "r,m"(value) : "memory");
 }
 
-inline void ClobberMemory() { asm volatile("" : : : "memory"); }
-
-// Granularity of the system clock, in nanoseconds: the smallest non-zero gap
-// between two back-to-back reads. On Apple Silicon this is ~41.7ns (a 24MHz
-// timebase), which is a hard floor for userspace timing -- there is no
-// finer-grained counter available without kernel support.
+// The smallest non-zero gap between two back-to-back clock reads, in ns. What
+// that number means depends on the platform:
 //
-// This matters for how the results are read. Individual samples are quantized
-// to multiples of this tick, so p50/p90 for the fastest operations are
-// resolution-limited (a p50 of one tick means "somewhere below one tick", not
-// "41.7ns"). The tails, where operations cost hundreds of nanoseconds, span
-// many ticks and are measured properly -- and those are what this project is
-// about. The mean stays informative at any percentile because the clock is
-// asynchronous to the work, so the quantization error dithers out.
+//   Apple Silicon  ~41.7ns, the clock's real resolution (a 24MHz timebase, and
+//                  nothing finer is reachable without kernel support). Samples
+//                  are quantized to multiples of it, so a p50 of one step means
+//                  "somewhere below 41.7ns".
+//   Linux          steady_clock resolves 1ns, so this measures the cost of
+//                  reading the clock (~20ns on the CI runner), not resolution.
+//                  Samples are not quantized, but every one carries that cost.
 //
-// Deliberately not subtracted from samples: the call overhead is smaller than
-// one tick, so any estimate of it is itself quantization noise, and subtracting
-// a noisy tick from every sample shifts the whole distribution.
+// Either way, only figures spanning many of these steps are measured properly,
+// which is why the benchmark runs a null book through the same loop and leads
+// with batched and untimed numbers. The mean stays informative on Apple
+// Silicon because the clock is asynchronous to the work, so the quantization
+// error dithers out.
+//
+// Deliberately not subtracted from samples: it is itself a noisy estimate, and
+// subtracting it from every sample would shift the whole distribution.
 inline std::uint64_t ClockTickNs() {
     constexpr int kIters = 200'000;
     std::uint64_t best = ~0ull;
@@ -100,7 +102,7 @@ private:
         return s;
     }
 
-    // Nearest-rank on the already-sorted, already-overhead-adjusted vector.
+    // Nearest-rank on an already-sorted vector.
     static std::uint64_t Percentile(const std::vector<std::uint64_t>& sorted,
                                     double q) {
         if (sorted.empty()) return 0;
@@ -110,7 +112,7 @@ private:
         return sorted[idx];
     }
 
-    std::vector<std::uint64_t> samples_[3];  // indexed by Op
+    std::vector<std::uint64_t> samples_[kOpCount];  // indexed by Op
     std::vector<std::uint64_t> all_;         // merged, built by Finalize()
 };
 

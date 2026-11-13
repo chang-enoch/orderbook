@@ -58,10 +58,7 @@ struct Trade {
     Price   price;
     Qty     qty;
 
-    friend bool operator==(const Trade& a, const Trade& b) {
-        return a.taker == b.taker && a.maker == b.maker &&
-               a.price == b.price && a.qty == b.qty;
-    }
+    friend bool operator==(const Trade&, const Trade&) = default;
 };
 
 // Returned by BestBid()/BestAsk() when that side is empty. Chosen so that the
@@ -85,11 +82,42 @@ struct BookConfig {
 // accepted on the other, and minPrice > maxPrice constructed fine on one and
 // threw std::length_error out of the other's vector sizing -- the same class of
 // silent divergence as the per-order rules.
+//
+// The maxOrders cap and the span-in-ticks cap come from the optimized book's
+// 32-bit order handles and level indices, whose all-ones value is reserved as
+// "none". A capacity or band that does not fit would wrap silently there, so
+// every engine refuses it up front instead.
 inline Status ValidateConfig(const BookConfig& cfg) {
+    constexpr std::uint64_t kMaxIndex = std::numeric_limits<std::uint32_t>::max();
     if (cfg.tick <= 0) return Status::InvalidConfig;
     if (cfg.minPrice > cfg.maxPrice) return Status::InvalidConfig;
-    if (cfg.maxOrders == 0) return Status::InvalidConfig;
+    if (cfg.maxOrders == 0 || cfg.maxOrders >= kMaxIndex) return Status::InvalidConfig;
+    // Unsigned subtraction: well-defined for any minPrice <= maxPrice, where the
+    // signed difference could overflow.
+    const std::uint64_t span = static_cast<std::uint64_t>(cfg.maxPrice) -
+                               static_cast<std::uint64_t>(cfg.minPrice);
+    // Both engines compute `price - minPrice` in signed arithmetic.
+    if (span > static_cast<std::uint64_t>(std::numeric_limits<Price>::max()))
+        return Status::InvalidConfig;
+    if (span / static_cast<std::uint64_t>(cfg.tick) >= kMaxIndex)
+        return Status::InvalidConfig;
     return Status::Ok;
+}
+
+// The per-order admission rules. Every engine calls these same functions, so
+// "identical semantics" is one definition rather than copies kept in step by
+// hand.
+inline Status CheckPrice(const BookConfig& cfg, Price price) {
+    if (price < cfg.minPrice || price > cfg.maxPrice) return Status::PriceOutOfBand;
+    if (cfg.tick != 1 && (price - cfg.minPrice) % cfg.tick != 0)
+        return Status::PriceNotOnTick;
+    return Status::Ok;
+}
+
+inline Status CheckOrder(const BookConfig& cfg, OrderId id, Price price, Qty qty) {
+    if (id == kReservedOrderId) return Status::ReservedId;
+    if (qty == 0) return Status::ZeroQty;
+    return CheckPrice(cfg, price);
 }
 
 inline constexpr Side Opposite(Side s) {

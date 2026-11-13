@@ -139,10 +139,9 @@ public:
         pool::StorageFor<T, Mode>().Give(p);
     }
 
+    // C++20 synthesizes != from this.
     template <class U>
     bool operator==(const ModePoolAlloc<U, Mode>&) const noexcept { return true; }
-    template <class U>
-    bool operator!=(const ModePoolAlloc<U, Mode>&) const noexcept { return false; }
 };
 
 template <class T>

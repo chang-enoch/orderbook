@@ -3,22 +3,23 @@
 #include "orderBook.h"
 #include "types.h"
 
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
 namespace bench {
 
 enum class Op : std::uint8_t { Add, Cancel, Modify };
+inline constexpr int kOpCount = 3;
 
 inline const char* OpName(Op op) {
     switch (op) {
         case Op::Add:    return "add";
         case Op::Cancel: return "cancel";
         case Op::Modify: return "modify";
-        default:         return "?";
     }
+    return "?";
 }
 
 struct Event {
@@ -62,6 +63,21 @@ private:
     std::uint64_t s_[2];
 };
 
+// Applies one event to any engine. Shared by the benchmark and the
+// differential test so both drive the engines through the identical calls.
+//
+// Modify is the `default` on purpose: an explicit `case Op::Modify` leaves
+// the compiler an out-of-range path to handle, and that extra branch sits
+// inside every timed operation.
+template <class Book>
+Status Apply(Book& b, const Event& e, std::vector<Trade>& out) {
+    switch (e.op) {
+        case Op::Add:    return b.AddOrder(e.id, e.side, e.price, e.qty, e.tif, out);
+        case Op::Cancel: return b.CancelOrder(e.id);
+        default:         return b.ModifyOrder(e.id, e.price, e.qty, out);
+    }
+}
+
 struct FlowConfig {
     std::uint64_t seed        = 0xC0FFEE;
     std::size_t   events      = 2'000'000;
@@ -87,39 +103,37 @@ struct FlowConfig {
 // Generates a deterministic stream of add/cancel/modify events around a slowly
 // random-walking mid, so the book keeps realistic depth and the touch moves.
 //
-// The generator does not simulate matching, so a cancel or modify may name an
-// order that has already been filled. That is realistic (real venues see the
-// same race) and, more importantly, both engines see the identical stream --
-// the harness reports the hit rate so the numbers stay interpretable.
+// Generation drives a scratch baseline book so it knows exactly which orders
+// are still resting. That costs nothing (it happens entirely ahead of the
+// timed run) and it means cancel/modify events name orders that are really
+// there -- otherwise most of them would degrade into a failed lookup and the
+// benchmark would measure lookup misses, not book work.
 inline std::vector<Event> Generate(const FlowConfig& cfg) {
     Rng rng(cfg.seed);
     std::vector<Event> events;
     events.reserve(cfg.events);
 
-    const Price tick = cfg.tick == 0 ? 1 : cfg.tick;
-    // Work in tick indices and convert on the way out, so every generated price
-    // is tick-aligned by construction and a non-unit tick is exercised properly
-    // rather than accidentally.
-    const std::int64_t maxIdx = (cfg.bandHigh - cfg.bandLow) / tick;
-    auto toPrice = [&](std::int64_t idx) {
-        if (idx < 0) idx = 0;
-        if (idx > maxIdx) idx = maxIdx;
-        return cfg.bandLow + idx * tick;
-    };
-
-    // Generation drives a scratch baseline book so it knows exactly which
-    // orders are still resting. That costs nothing (it happens entirely ahead
-    // of the timed run) and it means cancel/modify events name orders that are
-    // really there -- otherwise most of them would degrade into a failed
-    // lookup and the benchmark would measure lookup misses, not book work.
+    // Constructed first: it throws on an invalid band or tick, before any of
+    // the arithmetic below can divide by a zero tick.
     BookConfig bookCfg;
-    bookCfg.minPrice = cfg.bandLow;
-    bookCfg.maxPrice = cfg.bandHigh;
-    bookCfg.tick     = tick;
+    bookCfg.minPrice  = cfg.bandLow;
+    bookCfg.maxPrice  = cfg.bandHigh;
+    bookCfg.tick      = cfg.tick;
     bookCfg.maxOrders = cfg.liveRing * 4;
     OrderBook sim(bookCfg);
     std::vector<Trade> trades;
     trades.reserve(256);
+
+    // Work in tick indices and convert on the way out, so every generated price
+    // is tick-aligned by construction and a non-unit tick is exercised properly
+    // rather than accidentally.
+    const Price tick = cfg.tick;
+    const std::int64_t maxIdx = (cfg.bandHigh - cfg.bandLow) / tick;
+    auto clampIdx = [&](std::int64_t i) {
+        return i < 0 ? 0 : (i > maxIdx ? maxIdx : i);
+    };
+    auto toPrice = [&](std::int64_t idx) { return cfg.bandLow + clampIdx(idx) * tick; };
+    auto chance = [&](int pct) { return rng.Below(100) < static_cast<std::uint64_t>(pct); };
 
     struct LiveOrder { OrderId id; Price price; Qty qty; };
     std::vector<LiveOrder> live;
@@ -161,20 +175,24 @@ inline std::vector<Event> Generate(const FlowConfig& cfg) {
     auto randQty = [&] {
         return cfg.qtyMin + rng.Below(cfg.qtyMax - cfg.qtyMin + 1);
     };
-    auto clampIdx = [&](std::int64_t i) {
-        return i < 0 ? 0 : (i > maxIdx ? maxIdx : i);
-    };
 
-    // Turns a well-formed event into one the book must refuse. Each variant
-    // maps onto a distinct Status, so the differential test covers every
-    // rejection path rather than only the happy one.
+    // Turns a well-formed event into one the book must refuse. Between them
+    // the variants cover every rejection Status, so the differential test
+    // exercises each refusal path rather than only the happy one.
+    //
+    // Every variant must really be refused, because the caller skips updating
+    // the scratch book. Zero qty is only a refusal on an add: a modify to qty 0
+    // is a cancel, which the book accepts -- so with no tick to miss, a modify
+    // gets an out-of-band price instead. (Off-tick +1 on a price clamped to
+    // bandHigh lands out of band rather than off tick; still refused.)
     auto corrupt = [&](Event& e) {
         switch (rng.Below(4)) {
             case 0: e.price = cfg.bandHigh + tick * 10; break;   // out of band
             case 1: e.price = cfg.bandLow - tick * 10; break;    // out of band
             case 2:
-                if (tick != 1) e.price += 1;                     // off tick
-                else e.qty = 0;                                  // zero qty
+                if (tick != 1)            e.price += 1;          // off tick
+                else if (e.op == Op::Add) e.qty = 0;             // zero qty
+                else                      e.price = cfg.bandHigh + tick * 10;
                 break;
             default: e.id = kReservedOrderId; break;             // reserved id
         }
@@ -188,23 +206,22 @@ inline std::vector<Event> Generate(const FlowConfig& cfg) {
 
         if (roll < static_cast<std::uint64_t>(cfg.pctAdd) || live.empty()) {
             const bool buy = rng.Below(2) == 0;
-            const bool aggressive =
-                rng.Below(100) < static_cast<std::uint64_t>(cfg.pctAggressive);
+            const bool aggressive = chance(cfg.pctAggressive);
             const std::int64_t off =
                 1 + static_cast<std::int64_t>(rng.Below(cfg.depthTicks));
+            // An aggressive buy reaches up through the mid; a passive one
+            // rests below it. Sells mirror that.
+            const bool above = (buy == aggressive);
 
-            e.op   = Op::Add;
-            e.id   = nextId++;
-            e.side = buy ? Side::Buy : Side::Sell;
-            e.qty  = randQty();
-            e.price = toPrice(clampIdx(aggressive ? (buy ? midIdx + off : midIdx - off)
-                                                  : (buy ? midIdx - off : midIdx + off)));
-            e.tif = (aggressive &&
-                     rng.Below(100) < static_cast<std::uint64_t>(cfg.pctIoc))
-                        ? TimeInForce::Ioc
-                        : TimeInForce::Gtc;
+            e.op    = Op::Add;
+            e.id    = nextId++;
+            e.side  = buy ? Side::Buy : Side::Sell;
+            e.qty   = randQty();
+            e.price = toPrice(above ? midIdx + off : midIdx - off);
+            e.tif   = (aggressive && chance(cfg.pctIoc)) ? TimeInForce::Ioc
+                                                         : TimeInForce::Gtc;
 
-            if (rng.Below(100) < static_cast<std::uint64_t>(cfg.pctInvalid)) {
+            if (chance(cfg.pctInvalid)) {
                 corrupt(e);
                 events.push_back(e);
                 continue;  // the book will refuse it, so the pool is unchanged
@@ -218,7 +235,7 @@ inline std::vector<Event> Generate(const FlowConfig& cfg) {
         } else if (roll < static_cast<std::uint64_t>(cfg.pctAdd + cfg.pctCancel)) {
             e.op = Op::Cancel;
             e.id = live[rng.Below(live.size())].id;
-            if (rng.Below(100) < static_cast<std::uint64_t>(cfg.pctInvalid)) {
+            if (chance(cfg.pctInvalid)) {
                 e.id = kReservedOrderId;  // must be refused, pool unchanged
                 events.push_back(e);
                 continue;
@@ -231,19 +248,22 @@ inline std::vector<Event> Generate(const FlowConfig& cfg) {
             e.op = Op::Modify;
             e.id = target.id;
 
-            if (rng.Below(100) < static_cast<std::uint64_t>(cfg.pctResize) &&
-                target.qty > 1) {
+            if (chance(cfg.pctResize) && target.qty > 1) {
                 e.price = target.price;
                 e.qty   = 1 + rng.Below(target.qty - 1);
             } else {
                 const std::int64_t off =
                     1 + static_cast<std::int64_t>(rng.Below(cfg.depthTicks));
+                // LiveOrder keeps no side, so it is inferred from where the
+                // order sits relative to the *current* mid. Once the mid has
+                // drifted some reprices land on the other side and cross,
+                // which is realistic flow; changing it would change the tape.
                 const bool buy = target.price <= toPrice(midIdx);
-                e.price = toPrice(clampIdx(buy ? midIdx - off : midIdx + off));
+                e.price = toPrice(buy ? midIdx - off : midIdx + off);
                 e.qty   = randQty();
             }
 
-            if (rng.Below(100) < static_cast<std::uint64_t>(cfg.pctInvalid)) {
+            if (chance(cfg.pctInvalid)) {
                 corrupt(e);
                 events.push_back(e);
                 continue;  // refused, so the order stays as it was

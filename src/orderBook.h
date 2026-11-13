@@ -44,11 +44,7 @@ public:
 
     // Throws on an invalid config rather than limping along with a silently
     // coerced one. Both engines throw on exactly the same inputs.
-    explicit BasicOrderBook(const BookConfig& cfg = {})
-        : minPrice_(cfg.minPrice),
-          maxPrice_(cfg.maxPrice),
-          tick_(cfg.tick),
-          maxOrders_(cfg.maxOrders) {
+    explicit BasicOrderBook(const BookConfig& cfg = {}) : cfg_(cfg) {
         if (ValidateConfig(cfg) != Status::Ok)
             throw std::invalid_argument("BookConfig: invalid-config");
         // Rehashing mid-run would show up as pure noise in the tail.
@@ -61,8 +57,8 @@ public:
     // all, which a trade count cannot express.
     Status AddOrder(OrderId id, Side side, Price price, Qty qty, TimeInForce tif,
                     std::vector<Trade>& out) {
-        const Status v = Admissible(id, price, qty);
-        if (v != Status::Ok) return v;
+        if (const Status v = CheckOrder(cfg_, id, price, qty); v != Status::Ok)
+            return v;
         if (index_.count(id) != 0) return Status::DuplicateId;
 
         const Qty remainder = Match(id, side, price, qty, out);
@@ -70,7 +66,7 @@ public:
             // Capacity gates *resting*, not admission. An aggressive order
             // reduces the book, so a full book is no reason to refuse it the
             // trades it would have made; only the remainder is turned away.
-            if (index_.size() >= maxOrders_) return Status::CapacityExhausted;
+            if (index_.size() >= cfg_.maxOrders) return Status::CapacityExhausted;
             Rest(id, side, price, remainder);
         }
         return Status::Ok;
@@ -101,8 +97,8 @@ public:
             Erase(it);
             return Status::Ok;
         }
-        const Status v = Admissible(id, newPrice, newQty);
-        if (v != Status::Ok) return v;
+        if (const Status v = CheckOrder(cfg_, id, newPrice, newQty); v != Status::Ok)
+            return v;
 
         const Locator loc = it->second;
         const Side    side = loc.side;
@@ -112,8 +108,6 @@ public:
             if (newQty < oldQty) {
                 const Qty delta = oldQty - newQty;
                 loc.order->qty = newQty;
-                // The two maps differ in their comparator, so they are distinct
-                // types and the branch cannot be factored out.
                 if (side == Side::Buy) bids_.find(loc.price)->second.qty -= delta;
                 else                   asks_.find(loc.price)->second.qty -= delta;
                 return Status::Ok;
@@ -124,7 +118,10 @@ public:
         Erase(it);
         const Qty remainder = Match(id, side, newPrice, newQty, out);
         if (remainder > 0) {
-            if (index_.size() >= maxOrders_) return Status::CapacityExhausted;
+            // Cannot fire: the erase just freed a slot and matching only frees
+            // more. Kept as a guard, since firing here would break the
+            // refused-modify-leaves-the-order-untouched rule.
+            if (index_.size() >= cfg_.maxOrders) return Status::CapacityExhausted;
             Rest(id, side, newPrice, remainder);
         }
         return Status::Ok;
@@ -134,12 +131,7 @@ public:
     Price BestAsk() const { return asks_.empty() ? kNoAsk : asks_.begin()->first; }
 
     Qty QtyAt(Side side, Price price) const {
-        if (side == Side::Buy) {
-            auto it = bids_.find(price);
-            return it == bids_.end() ? 0 : it->second.qty;
-        }
-        auto it = asks_.find(price);
-        return it == asks_.end() ? 0 : it->second.qty;
+        return side == Side::Buy ? QtyIn(bids_, price) : QtyIn(asks_, price);
     }
 
     std::size_t OrderCount() const { return index_.size(); }
@@ -167,17 +159,15 @@ private:
                                      std::equal_to<OrderId>,
                                      Alloc<std::pair<const OrderId, Locator>>>;
 
-    // The admission rules, applied identically by both engines. The baseline
-    // has no structural need for a price band -- a std::map would hold any
-    // price -- but enforcing the same rules is what makes "identical semantics"
-    // a testable claim rather than an assertion.
-    Status Admissible(OrderId id, Price price, Qty qty) const {
-        if (id == kReservedOrderId) return Status::ReservedId;
-        if (qty == 0) return Status::ZeroQty;
-        if (price < minPrice_ || price > maxPrice_) return Status::PriceOutOfBand;
-        if (tick_ != 1 && (price - minPrice_) % tick_ != 0)
-            return Status::PriceNotOnTick;
-        return Status::Ok;
+    // The two sides are maps with different comparators, hence different
+    // types, so per-side logic is a template over the map and the caller
+    // branches on side. (A generic-lambda dispatcher reads more neatly but
+    // changed inlining enough to cost ~5% on this engine's throughput, which
+    // would bias the comparison.)
+    template <class Map>
+    static Qty QtyIn(const Map& book, Price price) {
+        auto it = book.find(price);
+        return it == book.end() ? 0 : it->second.qty;
     }
 
     void Erase(typename Index::iterator it) {
@@ -235,18 +225,13 @@ private:
         index_.emplace(id, Locator{side, price, std::prev(level.orders.end())});
     }
 
-    Price       minPrice_;
-    Price       maxPrice_;
-    Price       tick_;
-    std::size_t maxOrders_;
+    BookConfig cfg_;
 
     BidMap bids_;
     AskMap asks_;
     Index  index_;
 };
 
-// The two variants under test. Identical code, identical container shapes; the
-// only difference is where the nodes come from.
 using OrderBook = BasicOrderBook<std::allocator>;
 
 // The two allocator controls. Identical code, identical container shapes; the

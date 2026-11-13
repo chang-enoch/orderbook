@@ -48,10 +48,16 @@ jobs:
   # Not a pass/fail gate -- hardware and allocator vary too much for a
   # threshold to mean anything. It exists so the numbers are visible on a
   # second allocator (glibc) instead of being reported from one laptop.
+  #
+  # Pinned and self-describing, so a number quoted in the README can be traced
+  # to a toolchain and CPU rather than to whatever ubuntu-latest meant that day.
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: make all
+      - name: Environment
+        run: |
+          c++ --version
+          lscpu | head -20
       - name: Benchmark (glibc)
-        run: ./build/orderbook_bench --events=2000000 --reps=3
+        run: make run-bench

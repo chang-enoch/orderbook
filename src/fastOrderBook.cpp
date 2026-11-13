@@ -13,23 +13,20 @@ std::size_t NextPow2(std::size_t n) {
 }
 }  // namespace
 
-FastOrderBook::FastOrderBook(const BookConfig& cfg)
-    : minPrice_(cfg.minPrice),
-      maxPrice_(cfg.maxPrice),
-      tick_(cfg.tick),
-      levelCount_(0) {
+FastOrderBook::FastOrderBook(const BookConfig& cfg) : cfg_(cfg) {
     if (ValidateConfig(cfg) != Status::Ok)
         throw std::invalid_argument("BookConfig: invalid-config");
     // Only safe once the config is validated: an inverted band would make this
     // subtraction negative and the cast to size_t enormous.
-    levelCount_ = static_cast<std::size_t>((cfg.maxPrice - cfg.minPrice) / tick_) + 1;
+    const std::size_t levels =
+        static_cast<std::size_t>((cfg.maxPrice - cfg.minPrice) / cfg.tick) + 1;
 
-    levels_.assign(levelCount_, FlatLevel{});
-    bidMap_.Init(levelCount_);
-    askMap_.Init(levelCount_);
+    levels_.assign(levels, FlatLevel{});
+    bidMap_.Init(levels);
+    askMap_.Init(levels);
 
     // The slab is sized once and never grows; the freelist recycles.
-    nodes_.resize(cfg.maxOrders == 0 ? 1 : cfg.maxOrders);
+    nodes_.resize(cfg.maxOrders);
 
     // Load factor stays at or below 50%, which keeps linear probes short.
     const std::size_t cap = NextPow2(std::max<std::size_t>(cfg.maxOrders, 16) * 2);
@@ -158,7 +155,7 @@ std::size_t FastOrderBook::MapFind(OrderId id) const {
     while (true) {
         const OrderId k = keys_[i];
         if (k == id) return i;
-        if (k == kEmpty) return kNoIdx;
+        if (k == kEmpty) return kNoSlot;
         i = (i + 1) & mask_;
     }
 }
@@ -197,7 +194,7 @@ void FastOrderBook::MapEraseAt(std::size_t i) {
 // --- book -------------------------------------------------------------------
 
 Qty FastOrderBook::QtyAt(Side side, Price price) const {
-    if (!InBand(price)) return 0;
+    if (CheckPrice(cfg_, price) != Status::Ok) return 0;
     const Index idx = PriceToIdx(price);
     const Bitmap& bm = (side == Side::Buy) ? bidMap_ : askMap_;
     return bm.Test(idx) ? levels_[idx].qty : 0;
@@ -207,19 +204,17 @@ void FastOrderBook::Snapshot(std::vector<std::pair<Price, Qty>>& bids,
                              std::vector<std::pair<Price, Qty>>& asks) const {
     bids.clear();
     asks.clear();
-    for (Index i = (bestBid_ == kNoIdx ? kNoIdx : bidMap_.ScanDown(bestBid_));
-         i != kNoIdx; i = (i == 0 ? kNoIdx : bidMap_.ScanDown(i - 1)))
+    for (Index i = bestBid_; i != kNoIdx; i = BidBelow(i))
         bids.emplace_back(IdxToPrice(i), levels_[i].qty);
-    for (Index i = (bestAsk_ == kNoIdx ? kNoIdx : askMap_.ScanUp(bestAsk_));
-         i != kNoIdx; i = askMap_.ScanUp(i + 1))
+    for (Index i = bestAsk_; i != kNoIdx; i = AskAbove(i))
         asks.emplace_back(IdxToPrice(i), levels_[i].qty);
 }
 
 void FastOrderBook::Rest(OrderId id, Side side, Index idx, Qty qty) {
     const Handle h = Alloc();
-    // Callers check AtCapacity() before committing, so this cannot fire; it is
-    // kept so a future caller that forgets cannot corrupt the slab silently.
-    if (h == kNull) return;
+    // Callers check AtCapacity() first, which bounds the live count below the
+    // slab size, so the slab cannot be exhausted here.
+    assert(h != kNull);
 
     OrderNode& n = nodes_[h];
     n.id = id;
@@ -249,6 +244,27 @@ void FastOrderBook::Rest(OrderId id, Side side, Index idx, Qty qty) {
     ++liveOrders_;
 }
 
+void FastOrderBook::LevelEmptied(Side side, Index idx) {
+    // Only rescan when the touch itself emptied; otherwise the hint is still
+    // correct and this costs nothing.
+    if (side == Side::Buy) {
+        bidMap_.Clear(idx);
+        if (bestBid_ == idx) bestBid_ = BidBelow(idx);
+    } else {
+        askMap_.Clear(idx);
+        if (bestAsk_ == idx) bestAsk_ = AskAbove(idx);
+    }
+}
+
+void FastOrderBook::EraseAt(std::size_t slot) {
+    const Handle h = vals_[slot];
+    assert(h < nodes_.size());
+    Unlink(h);
+    Free(h);
+    MapEraseAt(slot);
+    --liveOrders_;
+}
+
 // Removes one node from its level, fixing up occupancy and the best-price hint
 // if that emptied the level.
 void FastOrderBook::Unlink(Handle h) {
@@ -262,19 +278,7 @@ void FastOrderBook::Unlink(Handle h) {
 
     lvl.qty -= n.qty;
 
-    if (lvl.head == kNull) {
-        const Index idx = n.level;
-        if (n.side == static_cast<std::uint8_t>(Side::Buy)) {
-            bidMap_.Clear(idx);
-            // Only rescan when the touch itself emptied; otherwise the hint is
-            // still correct and this costs nothing.
-            if (bestBid_ == idx)
-                bestBid_ = (idx == 0) ? kNoIdx : bidMap_.ScanDown(idx - 1);
-        } else {
-            askMap_.Clear(idx);
-            if (bestAsk_ == idx) bestAsk_ = askMap_.ScanUp(idx + 1);
-        }
-    }
+    if (lvl.head == kNull) LevelEmptied(static_cast<Side>(n.side), n.level);
 }
 
 Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
@@ -304,8 +308,8 @@ Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
             const Handle next = maker.next;
             const std::size_t slot = MapFind(maker.id);
             // A resting order is always in the table; if it were not, erasing
-            // at kNoIdx would index the key array out of bounds.
-            assert(slot != kNoIdx);
+            // at kNoSlot would index the key array out of bounds.
+            assert(slot != kNoSlot);
             MapEraseAt(slot);
             Free(h);
             --liveOrders_;
@@ -317,13 +321,7 @@ Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
             nodes_[h].prev = kNull;
         } else {
             lvl.tail = kNull;
-            if (takerIsBuy) {
-                askMap_.Clear(idx);
-                bestAsk_ = askMap_.ScanUp(idx + 1);
-            } else {
-                bidMap_.Clear(idx);
-                bestBid_ = (idx == 0) ? kNoIdx : bidMap_.ScanDown(idx - 1);
-            }
+            LevelEmptied(Opposite(side), idx);
         }
     }
     return qty;
@@ -331,9 +329,9 @@ Qty FastOrderBook::Match(OrderId taker, Side side, Price limit, Qty qty,
 
 Status FastOrderBook::AddOrder(OrderId id, Side side, Price price, Qty qty,
                                TimeInForce tif, std::vector<Trade>& out) {
-    const Status v = Admissible(id, price, qty);
-    if (v != Status::Ok) return v;
-    if (MapFind(id) != kNoIdx) return Status::DuplicateId;
+    if (const Status v = CheckOrder(cfg_, id, price, qty); v != Status::Ok)
+        return v;
+    if (MapFind(id) != kNoSlot) return Status::DuplicateId;
 
     const Qty remainder = Match(id, side, price, qty, out);
     if (remainder > 0 && tif == TimeInForce::Gtc) {
@@ -349,14 +347,8 @@ Status FastOrderBook::AddOrder(OrderId id, Side side, Price price, Qty qty,
 Status FastOrderBook::CancelOrder(OrderId id) {
     if (id == kReservedOrderId) return Status::ReservedId;
     const std::size_t slot = MapFind(id);
-    if (slot == kNoIdx) return Status::UnknownId;
-
-    const Handle h = vals_[slot];
-    assert(h < nodes_.size());
-    Unlink(h);
-    Free(h);
-    MapEraseAt(slot);      // the slot is already located; no second probe
-    --liveOrders_;
+    if (slot == kNoSlot) return Status::UnknownId;
+    EraseAt(slot);
     return Status::Ok;
 }
 
@@ -364,17 +356,10 @@ Status FastOrderBook::ModifyOrder(OrderId id, Price newPrice, Qty newQty,
                                   std::vector<Trade>& out) {
     if (id == kReservedOrderId) return Status::ReservedId;
     const std::size_t slot = MapFind(id);
-    if (slot == kNoIdx) return Status::UnknownId;
-
-    const Handle h = vals_[slot];
-    assert(h < nodes_.size());
-    OrderNode& n = nodes_[h];
-    const Side  side   = static_cast<Side>(n.side);
-    const Qty   oldQty = n.qty;
-    const Index oldIdx = n.level;
+    if (slot == kNoSlot) return Status::UnknownId;
 
     if (newQty == 0) {
-        CancelOrder(id);
+        EraseAt(slot);
         return Status::Ok;
     }
 
@@ -382,8 +367,13 @@ Status FastOrderBook::ModifyOrder(OrderId id, Price newPrice, Qty newQty,
     // first and then failing the re-add deleted the order and returned
     // success, which is how a reprice to an out-of-band or off-tick price
     // used to make an order vanish.
-    const Status v = Admissible(id, newPrice, newQty);
-    if (v != Status::Ok) return v;
+    if (const Status v = CheckOrder(cfg_, id, newPrice, newQty); v != Status::Ok)
+        return v;
+
+    OrderNode&  n      = nodes_[vals_[slot]];
+    const Side  side   = static_cast<Side>(n.side);
+    const Qty   oldQty = n.qty;
+    const Index oldIdx = n.level;
 
     if (PriceToIdx(newPrice) == oldIdx) {
         if (newQty < oldQty) {
@@ -395,9 +385,12 @@ Status FastOrderBook::ModifyOrder(OrderId id, Price newPrice, Qty newQty,
         if (newQty == oldQty) return Status::Ok;
     }
 
-    CancelOrder(id);
+    EraseAt(slot);
     const Qty remainder = Match(id, side, newPrice, newQty, out);
     if (remainder > 0) {
+        // Cannot fire: the erase just freed a slot and matching only frees
+        // more. Kept as a guard, since firing here would break the
+        // refused-modify-leaves-the-order-untouched rule.
         if (AtCapacity()) return Status::CapacityExhausted;
         Rest(id, side, PriceToIdx(newPrice), remainder);
     }

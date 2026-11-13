@@ -2,8 +2,10 @@
 #include "flow.h"
 #include "orderBook.h"
 
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
+#include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -76,8 +78,7 @@ void UnitCases(const char* engine) {
         b.AddOrder(2, Side::Sell, 102, 10, TimeInForce::Gtc, tr);
         b.AddOrder(3, Side::Sell, 103, 10, TimeInForce::Gtc, tr);
         tr.clear();
-        // Sweeps 101 and 102, rests 5 at 103's price limit... but 103 crosses
-        // too, so it fills 5 there and rests nothing.
+        // Sweeps 101 and 102, then takes 5 of the 10 at 103. Nothing rests.
         b.AddOrder(4, Side::Buy, 103, 25, TimeInForce::Gtc, tr);
         CheckEq(tr.size(), std::size_t{3}, "trade count");
         CheckEq(b.BestAsk(), Price{103}, "best ask after sweep");
@@ -276,6 +277,72 @@ void UnitCases(const char* engine) {
         }
         CheckEq(b.OrderCount(), std::size_t{0}, "no leaks");
     }
+    {
+        // A modify to qty 0 is a cancel, so the new price is never checked.
+        g_case = "modify-to-zero-cancels";
+        Book b(cfg);
+        std::vector<Trade> tr;
+        b.AddOrder(1, Side::Buy, 100, 10, TimeInForce::Gtc, tr);
+        CheckStatus(b.ModifyOrder(1, cfg.maxPrice + 1, 0, tr), Status::Ok,
+                    "zero-qty modify cancels, even at an out-of-band price");
+        CheckEq(b.OrderCount(), std::size_t{0}, "order is gone");
+        CheckStatus(b.ModifyOrder(1, 100, 0, tr), Status::UnknownId,
+                    "zero-qty modify of an unknown id");
+    }
+    {
+        // Levels scattered across a million-tick band, so best-price rescans
+        // have to cross bitmap words at every level of the hierarchy and run
+        // off both ends of the band. The differential tape stays within a
+        // few dozen ticks of the mid and never reaches these paths.
+        g_case = "sparse-wide-band";
+        BookConfig w;
+        w.minPrice = 1;
+        w.maxPrice = 1'000'000;
+        w.maxOrders = 4096;
+        Book b(w);
+        std::vector<Trade> tr;
+        const Price bidPx[] = {1, 70'000, 600'000};          // ids 1..3
+        const Price askPx[] = {600'001, 999'999, 1'000'000};  // ids 4..6
+        OrderId id = 1;
+        for (Price p : bidPx) b.AddOrder(id++, Side::Buy, p, 10, TimeInForce::Gtc, tr);
+        for (Price p : askPx) b.AddOrder(id++, Side::Sell, p, 10, TimeInForce::Gtc, tr);
+        CheckEq(tr.size(), std::size_t{0}, "nothing crosses");
+
+        std::vector<std::pair<Price, Qty>> sb, sa;
+        b.Snapshot(sb, sa);
+        Check(sb.size() == 3 && sb.front().first == 600'000 && sb.back().first == 1,
+              "bid depth spans the band");
+        Check(sa.size() == 3 && sa.front().first == 600'001 &&
+                  sa.back().first == 1'000'000,
+              "ask depth spans the band");
+
+        // Cancel the touch each time: the rescan crosses an l2 word, then an
+        // l1 word, then runs off the bottom of the band.
+        CheckStatus(b.CancelOrder(3), Status::Ok, "cancel bid 600000");
+        CheckEq(b.BestBid(), Price{70'000}, "rescan across l2 words");
+        CheckStatus(b.CancelOrder(2), Status::Ok, "cancel bid 70000");
+        CheckEq(b.BestBid(), Price{1}, "rescan down to the lowest tick");
+        CheckStatus(b.CancelOrder(1), Status::Ok, "cancel bid 1");
+        CheckEq(b.BestBid(), kNoBid, "bid side empty");
+        CheckStatus(b.CancelOrder(4), Status::Ok, "cancel ask 600001");
+        CheckEq(b.BestAsk(), Price{999'999}, "rescan up across l2 words");
+
+        // One aggressive order sweeps to the top of the band...
+        tr.clear();
+        CheckStatus(b.AddOrder(10, Side::Buy, 1'000'000, 20, TimeInForce::Ioc, tr),
+                    Status::Ok, "sweep up");
+        CheckEq(tr.size(), std::size_t{2}, "took both remaining asks");
+        CheckEq(b.BestAsk(), kNoAsk, "ask side empty");
+
+        // ...and another sweeps down to the bottom of it.
+        for (Price p : bidPx) b.AddOrder(id++, Side::Buy, p, 10, TimeInForce::Gtc, tr);
+        tr.clear();
+        CheckStatus(b.AddOrder(20, Side::Sell, 1, 30, TimeInForce::Ioc, tr),
+                    Status::Ok, "sweep down");
+        CheckEq(tr.size(), std::size_t{3}, "took all three bids");
+        CheckEq(b.BestBid(), kNoBid, "bid side empty after sweep");
+        CheckEq(b.OrderCount(), std::size_t{0}, "book empty");
+    }
     std::printf("  unit cases done for %s\n", engine);
 }
 
@@ -283,39 +350,30 @@ void UnitCases(const char* engine) {
 // Differential: both engines see the same flow and must agree after every event.
 // ---------------------------------------------------------------------------
 
-// Applies one event and reports what the engine decided, so the comparison
-// covers the decision as well as its consequences.
-template <class Book>
-Status Apply(Book& b, const bench::Event& e, std::vector<Trade>& out) {
-    switch (e.op) {
-        case bench::Op::Add:
-            return b.AddOrder(e.id, e.side, e.price, e.qty, e.tif, out);
-        case bench::Op::Cancel:
-            return b.CancelOrder(e.id);
-        default:
-            return b.ModifyOrder(e.id, e.price, e.qty, out);
-    }
-}
-
 // Compares one engine against the reference after every event: the decision,
 // the trades, the touch, the live count, and finally the whole depth.
+// `capacityHits` receives how many events the reference refused for capacity,
+// so a row meant to exercise that path can prove it did.
 template <class Ref, class Test>
 bool DifferentialPair(const char* label, const std::vector<bench::Event>& stream,
-                      const BookConfig& cfg, std::uint64_t seed) {
+                      const BookConfig& cfg, std::uint64_t seed,
+                      std::size_t& capacityHits) {
     Ref  ref(cfg);
     Test test(cfg);
     std::vector<Trade> tr, tt;
     std::vector<std::pair<Price, Qty>> rb, ra, tb, ta;
     std::size_t rejected = 0;
+    capacityHits = 0;
 
     for (std::size_t i = 0; i < stream.size(); ++i) {
         const bench::Event& e = stream[i];
         tr.clear();
         tt.clear();
 
-        const Status sr = Apply(ref, e, tr);
-        const Status st = Apply(test, e, tt);
+        const Status sr = bench::Apply(ref, e, tr);
+        const Status st = bench::Apply(test, e, tt);
         rejected += (sr != Status::Ok) ? 1 : 0;
+        capacityHits += (sr == Status::CapacityExhausted) ? 1 : 0;
 
         if (sr != st) {
             std::printf("  DIFF %s seed=%llu event %zu: status %s vs %s\n", label,
@@ -357,8 +415,8 @@ bool DifferentialPair(const char* label, const std::vector<bench::Event>& stream
                     (unsigned long long)seed);
         return false;
     }
-    std::printf("    %-22s ok  (%zu events, %zu refused, %zu/%zu levels)\n", label,
-                stream.size(), rejected, rb.size(), ra.size());
+    std::printf("    %-22s ok  (%zu events, %zu refused, %zu at capacity, %zu/%zu levels)\n",
+                label, stream.size(), rejected, capacityHits, rb.size(), ra.size());
     return true;
 }
 
@@ -370,29 +428,42 @@ void ConfigCases() {
     const BookConfig good{1, 1000, 1, 4096};
     CheckStatus(ValidateConfig(good), Status::Ok, "a sane config validates");
 
+    constexpr Price kMin = std::numeric_limits<Price>::min();
+    constexpr Price kMax = std::numeric_limits<Price>::max();
     struct Bad { BookConfig cfg; const char* why; };
     const Bad bad[] = {
         {{1, 1000, 1, 0}, "maxOrders = 0"},
         {{1000, 1, 1, 64}, "minPrice > maxPrice"},
         {{1, 1000, 0, 64}, "tick = 0"},
         {{1, 1000, -5, 64}, "negative tick"},
+        // Would wrap the optimized book's 32-bit level index or order handle.
+        {{0, Price{1} << 32, 1, 64}, "band wider than 2^32 ticks"},
+        {{1, 1000, 1, std::size_t{1} << 32}, "maxOrders >= 2^32"},
+        // Would overflow `price - minPrice`, even though the tick keeps the
+        // level count small.
+        {{kMin, kMax, Price{1} << 62, 64}, "band wider than INT64_MAX"},
+    };
+    // Every engine must refuse it the same way -- silently coercing it, as
+    // tick = 0 used to be coerced to 1, is how configs diverge unnoticed.
+    auto throws = [](auto construct) {
+        // Only the deliberate refusal counts. A bad_alloc from sizing a
+        // gigantic band would also "throw", and would hide lost validation.
+        try { construct(); } catch (const std::invalid_argument&) { return true; }
+        return false;
     };
     for (const Bad& b : bad) {
         CheckStatus(ValidateConfig(b.cfg), Status::InvalidConfig, b.why);
-        // Every engine must refuse it the same way -- silently coercing it, as
-        // tick = 0 used to be coerced to 1, is how configs diverge unnoticed.
-        bool baseThrew = false, poolThrew = false, fastThrew = false;
-        try { OrderBook x(b.cfg); (void)x; } catch (const std::exception&) { baseThrew = true; }
-        try { PooledOrderBook x(b.cfg); (void)x; } catch (const std::exception&) { poolThrew = true; }
-        try { FastOrderBook x(b.cfg); (void)x; } catch (const std::exception&) { fastThrew = true; }
-        Check(baseThrew && poolThrew && fastThrew,
-              std::string("all engines reject ") + b.why);
+        const bool all = throws([&] { OrderBook x(b.cfg); }) &&
+                         throws([&] { PooledOrderBook x(b.cfg); }) &&
+                         throws([&] { ScatteredOrderBook x(b.cfg); }) &&
+                         throws([&] { FastOrderBook x(b.cfg); });
+        Check(all, std::string("all engines reject ") + b.why);
     }
     std::printf("  config cases done\n");
 }
 
 bool Differential(std::uint64_t seed, std::size_t events, Price tick,
-                  int pctInvalid, std::size_t maxOrders) {
+                  int pctInvalid, std::size_t maxOrders, bool mustHitCapacity) {
     bench::FlowConfig flow;
     flow.seed = seed;
     flow.events = events;
@@ -414,14 +485,21 @@ bool Differential(std::uint64_t seed, std::size_t events, Price tick,
                 (unsigned long long)seed, (long long)tick, pctInvalid, maxOrders);
 
     bool ok = true;
+    std::size_t capacityHits = 0;
     // The pooled baseline runs the identical algorithm over a different
     // allocator, so any disagreement there is an allocator bug, not a logic one.
     ok &= DifferentialPair<OrderBook, PooledOrderBook>("pooled vs baseline",
-                                                       stream, cfg, seed);
+                                                       stream, cfg, seed, capacityHits);
     ok &= DifferentialPair<OrderBook, ScatteredOrderBook>("scattered vs baseline",
-                                                          stream, cfg, seed);
+                                                          stream, cfg, seed, capacityHits);
     ok &= DifferentialPair<OrderBook, FastOrderBook>("fast vs baseline", stream,
-                                                     cfg, seed);
+                                                     cfg, seed, capacityHits);
+    // A capacity row that never reaches capacity tests nothing. This one used
+    // to be sized above the flow's peak live count and silently did just that.
+    if (mustHitCapacity && capacityHits == 0) {
+        std::printf("  FAIL capacity %zu was never reached; lower it\n", maxOrders);
+        ok = false;
+    }
     return ok;
 }
 
@@ -439,17 +517,25 @@ int main(int argc, char** argv) {
     ConfigCases();
 
     std::printf("\ndifferential:\n");
-    struct Case { std::uint64_t seed; Price tick; int invalid; std::size_t cap; };
+    struct Case {
+        std::uint64_t seed;
+        Price         tick;
+        int           invalid;
+        std::size_t   cap;
+        bool          mustHitCap;
+    };
     // Non-unit ticks, deliberately inadmissible events, and a capacity small
     // enough to be hit under load were all untested before, and all three had
-    // divergences hiding in them.
-    for (const Case& c : {Case{1, 1, 0, 1u << 18},
-                          Case{7, 1, 5, 1u << 18},
-                          Case{42, 1, 15, 1u << 18},
-                          Case{0xC0FFEE, 5, 5, 1u << 18},
-                          Case{123456789, 25, 10, 1u << 18},
-                          Case{31337, 1, 5, 4096}}) {
-        if (!Differential(c.seed, events / 2, c.tick, c.invalid, c.cap)) ++g_failures;
+    // divergences hiding in them. This flow peaks around 800 live orders, so
+    // the last row's 256 is reached constantly.
+    for (const Case& c : {Case{1, 1, 0, 1u << 18, false},
+                          Case{7, 1, 5, 1u << 18, false},
+                          Case{42, 1, 15, 1u << 18, false},
+                          Case{0xC0FFEE, 5, 5, 1u << 18, false},
+                          Case{123456789, 25, 10, 1u << 18, false},
+                          Case{31337, 1, 5, 256, true}}) {
+        if (!Differential(c.seed, events / 2, c.tick, c.invalid, c.cap, c.mustHitCap))
+            ++g_failures;
     }
 
     std::printf("\n%s\n", g_failures == 0 ? "ALL PASS" : "FAILURES PRESENT");

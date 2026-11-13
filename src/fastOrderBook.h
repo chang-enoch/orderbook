@@ -47,8 +47,9 @@ private:
     using Handle = std::uint32_t;
     using Index  = std::uint32_t;
 
-    static constexpr Handle kNull  = 0xFFFFFFFFu;
-    static constexpr Index  kNoIdx = 0xFFFFFFFFu;
+    static constexpr Handle      kNull  = 0xFFFFFFFFu;
+    static constexpr Index       kNoIdx = 0xFFFFFFFFu;
+    static constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
 
     // 32 bytes: two orders per cache line, and the fields touched together
     // during a match (qty, next) sit adjacent.
@@ -73,15 +74,11 @@ private:
 
     // --- price <-> index -----------------------------------------------------
     Index PriceToIdx(Price p) const {
-        const Price off = p - minPrice_;
-        return static_cast<Index>(tick_ == 1 ? off : off / tick_);
+        const Price off = p - cfg_.minPrice;
+        return static_cast<Index>(cfg_.tick == 1 ? off : off / cfg_.tick);
     }
     Price IdxToPrice(Index i) const {
-        return minPrice_ + static_cast<Price>(i) * tick_;
-    }
-    bool InBand(Price p) const {
-        if (p < minPrice_ || p > maxPrice_) return false;
-        return tick_ == 1 || (p - minPrice_) % tick_ == 0;
+        return cfg_.minPrice + static_cast<Price>(i) * cfg_.tick;
     }
 
     // --- occupancy bitmap ----------------------------------------------------
@@ -140,20 +137,11 @@ private:
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
         return z ^ (z >> 31);
     }
-    // Returns the probe slot holding `id`, or kNoIdx.
+    // Returns the probe slot holding `id`, or kNoSlot.
     std::size_t MapFind(OrderId id) const;
     void        MapInsert(OrderId id, Handle h);
     void        MapEraseAt(std::size_t slot);
 
-    // The admission rules, identical to the baseline's.
-    Status Admissible(OrderId id, Price price, Qty qty) const {
-        if (id == kReservedOrderId) return Status::ReservedId;
-        if (qty == 0) return Status::ZeroQty;
-        if (price < minPrice_ || price > maxPrice_) return Status::PriceOutOfBand;
-        if (tick_ != 1 && (price - minPrice_) % tick_ != 0)
-            return Status::PriceNotOnTick;
-        return Status::Ok;
-    }
     bool AtCapacity() const {
         // The probe loop does not terminate on a full table, and linear probing
         // degrades badly past ~70% load, so half-full is a hard limit.
@@ -165,11 +153,23 @@ private:
                std::vector<Trade>& out);
     void Rest(OrderId id, Side side, Index idx, Qty qty);
     void Unlink(Handle h);
+    // These two sit on the hot paths -- LevelEmptied in matching and both in
+    // cancel/modify -- and exist only to avoid writing the same code twice. Left to its own judgement the compiler
+    // outlines them, which measurably costs throughput (~7% here), so they
+    // are forced inline: the factoring must not show up in the numbers.
+    //
+    // Removes the resting order whose table entry is at `slot`: unlinks it,
+    // frees its node, and erases the entry, with no second probe.
+    [[gnu::always_inline]] inline void EraseAt(std::size_t slot);
+    // Clears the occupancy bit for a level that just emptied and, if it was
+    // the touch, rescans for the new best price on that side.
+    [[gnu::always_inline]] inline void LevelEmptied(Side side, Index idx);
 
-    Price       minPrice_;
-    Price       maxPrice_;
-    Price       tick_;
-    std::size_t levelCount_;
+    // Next occupied level strictly beyond `i`, toward the far side of the book.
+    Index BidBelow(Index i) const { return i == 0 ? kNoIdx : bidMap_.ScanDown(i - 1); }
+    Index AskAbove(Index i) const { return askMap_.ScanUp(i + 1); }
+
+    BookConfig cfg_;
 
     std::vector<FlatLevel> levels_;
     Bitmap                 bidMap_;
@@ -179,7 +179,7 @@ private:
     Handle                 freeHead_ = kNull;
     Handle                 nodeHigh_ = 0;   // slab bump pointer
 
-    std::vector<OrderId> keys_;   // kEmpty = free, kTomb = erased
+    std::vector<OrderId> keys_;   // kEmpty = free
     std::vector<Handle>  vals_;
     std::size_t          mask_ = 0;
 
