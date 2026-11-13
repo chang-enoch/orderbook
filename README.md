@@ -12,17 +12,19 @@ Headline, measured by CI on ubuntu/glibc/gcc (x86-64, `-O3`, C++20) — Linux is
 the realistic deployment target, and these numbers are re-measured on every push
 rather than reported from a laptop. The job is `benchmark` in
 `.github/workflows/ci.yml`; it runs `make run-bench` on a pinned runner image and
-logs the compiler and CPU alongside the results:
+logs the compiler and CPU alongside the results. The figures below are from an AMD
+EPYC 9V45 (Zen 5) with gcc 13.3; GitHub's runner pool mixes CPUs, so a later run may
+land on different hardware, and its log says which:
 
 | ns/op (batched) | baseline | + pool alloc | optimized   |
 | --------------- | -------- | ------------ | ----------- |
-| batched timing  | 71.7     | 62.3         | **28.6**    |
-| throughput      | 14.1M/s  | 16.1M/s      | **35.4M/s** |
-| vs. baseline    | —        | 1.14×        | **2.52×**   |
+| batched timing  | 61.6     | 53.9         | **22.5**    |
+| throughput      | 16.3M/s  | 18.7M/s      | **43.7M/s** |
+| vs. baseline    | —        | 1.14×        | **2.74×**   |
 
 **Read the middle column first.** "+ pool alloc" is the baseline's exact algorithm
 and container shapes over a freelist instead of `malloc`. It accounts for 1.14× of
-the 2.52×, so the great majority of the win here is the memory layout — but that
+the 2.74×, so the great majority of the win here is the memory layout — but that
 split is a property of the allocator being replaced, and on a slower `malloc` it
 looks very different. See below.
 
@@ -36,13 +38,12 @@ algorithm and container shapes:
 
 | step             | ns/op | ratio | what it isolates                             |
 | ---------------- | ----- | ----- | -------------------------------------------- |
-| baseline         | 71.7  | —     | `std::map` + `std::list` + `malloc`          |
-| → scattered pool | 63.0  | 1.14× | no `malloc`, addresses left spread out       |
-| → clustered pool | 62.3  | 1.01× | same allocator, live nodes compacted         |
-| → optimized      | 28.6  | 2.18× | flat levels, slab arena, hierarchical bitmap |
+| baseline         | 61.6  | —     | `std::map` + `std::list` + `malloc`          |
+| → scattered pool | 54.9  | 1.12× | no `malloc`, addresses left spread out       |
+| → clustered pool | 53.9  | 1.02× | same allocator, live nodes compacted         |
+| → optimized      | 22.5  | 2.40× | flat levels, slab arena, hierarchical bitmap |
 
-The clustering step is worth about **1%**, and it measures 1.01× on _both_
-platforms — so on this workload the freelist's locality bonus is negligible and
+The clustering step is worth only **1–2%**: 1.02× on glibc and 1.01× on the M3 — so on this workload the freelist's locality bonus is negligible and
 the allocator step really is allocation cost. That replication across two
 allocators and two microarchitectures is what makes it a result rather than a
 coincidence.
@@ -54,27 +55,30 @@ detect a locality effect that would only appear with a much larger book. See
 
 #### The allocator share is not portable
 
-The same code on an Apple M3 (macOS `libmalloc`, clang 21) decomposes differently:
+The same code on an Apple M3 (macOS `libmalloc`, clang 21) decomposes differently.
+The M3 column was measured locally on the previous revision — laptop timings are too
+noisy to refresh casually — and the engine changes since were checked on the M3 as
+performance-neutral within a few percent:
 
 | step             | Linux · glibc | M3 · libmalloc |
 | ---------------- | ------------- | -------------- |
-| baseline         | 71.7          | 61.6           |
-| → scattered pool | 1.14×         | **1.70×**      |
-| → clustered pool | 1.01×         | 1.01×          |
-| → optimized      | 2.18×         | **2.20×**      |
-| **total**        | **2.52×**     | **3.77×**      |
+| baseline         | 61.6          | 61.6           |
+| → scattered pool | 1.12×         | **1.70×**      |
+| → clustered pool | 1.02×         | 1.01×          |
+| → optimized      | 2.40×         | **2.20×**      |
+| **total**        | **2.74×**     | **3.77×**      |
 
-Two things fall out of that. The layout step is 2.18× against 2.20× — it survives a
-change of allocator, compiler and instruction set, and it is the finding. The
+Two things fall out of that. The layout step is 2.40× against 2.20× — within 10%
+across a change of allocator, compiler, instruction set and CPU vendor, and it is the
+finding. The
 allocator step does not: `libmalloc` is slow enough that removing it looks like a
 major optimization, while against glibc the same change is a minor one. **The total
-is therefore 2.5–3.8× depending on whose `malloc` you are replacing**, and any
+is therefore 2.7–3.8× depending on whose `malloc` you are replacing**, and any
 single-platform figure for it is a local condition rather than a result.
 
-Everything that does not allocate runs about 1.75× faster on the M3 than on the CI
-runner; the baseline, which allocates constantly, runs only 1.16× faster. Netting
-that out puts `malloc` at ~25 ns/op on macOS against ~8.7 ns/op on glibc, for an
-identical number of allocations.
+The baseline and the scattered pool do identical work and differ only in calling
+`malloc`, so their difference is what the allocator costs per operation: ~6.7 ns on
+glibc against ~25 ns on macOS, for an identical number of allocations.
 
 ### Why the headline is not a p99
 
@@ -85,13 +89,13 @@ an engine that does nothing — and prints it as the first row:
 
 | ns, per-operation timing | mean | p50 | p99 | p99.9 |
 | ------------------------ | ---- | --- | --- | ----- |
-| null book (harness only) | 24.0 | 20  | 31  | 31    |
-| baseline                 | 87.9 | 80  | 210 | 311   |
-| pooled baseline          | 80.0 | 70  | 181 | 291   |
-| optimized                | 57.3 | 50  | 171 | 280   |
+| null book (harness only) | 21.4 | 20  | 30  | 31    |
+| baseline                 | 72.5 | 70  | 160 | 220   |
+| pooled baseline          | 65.9 | 60  | 140 | 201   |
+| optimized                | 43.1 | 40  | 90  | 190   |
 
-Those figures compress the result badly: they put the optimized engine 1.23× ahead
-at p99, where the uninstrumented measurements put it at 2.52×. The harness floor is
+Those figures compress the result badly: they put the optimized engine 1.78× ahead
+at p99, where the uninstrumented measurements put it at 2.74×. The harness floor is
 a third of the signal, and the clock reads disturb the very pipeline being measured.
 
 On the M3 it is worse than compression — it is total. There the timer tick is
@@ -265,7 +269,7 @@ same algorithm.
 Measured only on an M3, the control said pooling alone bought about 1.7× and the
 layout a further 2.2×, and an earlier version of this README summarized that as
 "half allocator, half layout". On glibc the same control buys 1.14×, while the
-layout step holds at 2.2×. The layout result replicates; the allocator result was a
+layout step holds at 2.2–2.4×. The layout result replicates; the allocator result was a
 property of macOS `libmalloc`. That is why the headline leads with glibc, and why
 `ScatteredOrderBook` was added to check that the freelist's speedup really is
 allocation cost rather than locality (see [Decomposing the win](#decomposing-the-win)).
@@ -308,7 +312,7 @@ so samples are multiples of 41.7 ns and nothing finer is reachable without kerne
 On Linux the clock resolves 1 ns, but reading it costs ~20 ns on the CI runner. Rather than
 assert either is fine, the benchmark measures it: a null book with the same interface and no
 work runs through the identical timing loop, and its distribution is the first row of the
-latency table. On CI it reports p99 = 31 ns against the optimized engine's 171 ns; on the M3
+latency table. On CI it reports p99 = 30 ns against the optimized engine's 90 ns; on the M3
 it reports p99 = 42 ns against the optimized engine's 42 ns — the same single tick, which is
 to say no signal at all.
 
